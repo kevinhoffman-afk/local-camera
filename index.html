@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Camera</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; color: #fff; font: 14px/1.4 system-ui, sans-serif; }
+    video { display: none; }
+    canvas { width: 100%; height: 100%; object-fit: contain; display: block; }
+    canvas.mirror { transform: scaleX(-1); }
+    .bar {
+      position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%);
+      display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: center;
+      padding: 8px 12px; border-radius: 12px; background: rgba(0, 0, 0, 0.55);
+      max-width: calc(100% - 32px); box-sizing: border-box;
+    }
+    select, button {
+      font: inherit; color: #fff; background: #222; border: 1px solid #444;
+      border-radius: 8px; padding: 6px 10px; cursor: pointer;
+    }
+    button:hover, select:hover { background: #333; }
+    .msg {
+      position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+      text-align: center; padding: 16px; pointer-events: none;
+    }
+    .msg[hidden] { display: none; }
+    .status { position: fixed; top: 12px; left: 12px; font-size: 12px; opacity: 0.7; }
+  </style>
+</head>
+<body>
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="out" class="mirror"></canvas>
+  <div id="msg" class="msg">Starting camera…</div>
+  <div id="status" class="status"></div>
+  <div class="bar">
+    <select id="cameras" aria-label="Camera" hidden></select>
+    <button id="heads" type="button">Three heads: on</button>
+    <button id="mirror" type="button">Mirror: on</button>
+    <button id="snap" type="button">Snapshot</button>
+  </div>
+
+  <script type="module">
+    import { FaceDetector, FilesetResolver } from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs';
+
+    const video = document.getElementById('video');
+    const out = document.getElementById('out');
+    const g = out.getContext('2d');
+    const msg = document.getElementById('msg');
+    const status = document.getElementById('status');
+    const picker = document.getElementById('cameras');
+    const col = document.createElement('canvas');     // the head + neck, feathered at the edges
+    const cg = col.getContext('2d');
+    let stream = null, detector = null, heads = true;
+    let face = null;                                   // smoothed face box in video pixels
+    let lastTs = 0;                                    // the detector needs increasing timestamps
+
+    function show(text) { msg.textContent = text; msg.hidden = !text; }
+
+    async function start(deviceId) {
+      if (stream) stream.getTracks().forEach(t => t.stop());
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: deviceId ? { deviceId: { exact: deviceId } } : { width: { ideal: 1280 }, height: { ideal: 720 } },
+          audio: false,
+        });
+        video.srcObject = stream;
+        await video.play();
+        show('');
+        await listCameras(stream.getVideoTracks()[0].getSettings().deviceId);
+      } catch (err) {
+        show(err.name === 'NotAllowedError'
+          ? 'Camera access was blocked. Allow it in your browser’s site settings and reload.'
+          : `Couldn’t start the camera: ${err.message}`);
+      }
+    }
+
+    // Device names are only available once permission has been granted.
+    async function listCameras(currentId) {
+      const devices = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+      picker.innerHTML = '';
+      devices.forEach((d, i) => picker.add(new Option(d.label || `Camera ${i + 1}`, d.deviceId, false, d.deviceId === currentId)));
+      picker.hidden = devices.length < 2;
+    }
+
+    async function loadDetector() {
+      status.textContent = 'Loading face tracking…';
+      try {
+        const vision = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+        detector = await FaceDetector.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite',
+            delegate: 'GPU',
+          },
+          runningMode: 'VIDEO',
+        });
+        status.textContent = '';
+      } catch (err) {
+        status.textContent = 'Face tracking unavailable — using a fixed position';
+      }
+    }
+
+    function trackFace(now) {
+      const W = video.videoWidth, H = video.videoHeight;
+      let box = null;
+      if (detector) {
+        lastTs = Math.max(now, lastTs + 1);
+        const d = detector.detectForVideo(video, lastTs).detections[0];
+        if (d) box = d.boundingBox;
+      }
+      if (!box && !face) box = { originX: W * 0.4, originY: H * 0.2, width: W * 0.2, height: W * 0.2 };
+      if (!box) return;                                // keep the last position for a moment
+      if (!face) { face = { x: box.originX, y: box.originY, w: box.width, h: box.height }; return; }
+      const k = 0.35;                                  // smooth out detector jitter
+      face.x += (box.originX - face.x) * k; face.y += (box.originY - face.y) * k;
+      face.w += (box.width - face.w) * k;   face.h += (box.height - face.h) * k;
+    }
+
+    // Everything below the neck is drawn as-is. The head and neck are cut out with a soft
+    // mask and drawn three times: the copies share the base of the neck and branch apart
+    // up the length of the neck, so one neck splits into three heads.
+    const mask = document.createElement('canvas');
+    const mg = mask.getContext('2d');
+    function drawHeads() {
+      const H = out.height;
+      const cx = face.x + face.w / 2;
+      const chinY = face.y + face.h;
+      const neckY = Math.min(H, chinY + face.h * 0.5);       // where the split starts
+      const top = Math.max(0, face.y - face.h * 0.6);        // top of the head, hair included
+      const colW = Math.round(face.w * 2.2), colX = Math.round(cx - colW / 2);
+      const colY = Math.round(top), colH = Math.round(neckY + face.h * 0.25 - top);
+      if (colW < 8 || colH < 8) return;
+
+      // soft head + neck silhouette, relative to the column
+      mask.width = colW; mask.height = colH;
+      const blur = Math.max(2, face.w * 0.06);
+      mg.filter = `blur(${blur}px)`;
+      mg.fillStyle = '#000';
+      mg.beginPath();
+      mg.ellipse(colW / 2, face.y + face.h * 0.38 - top, face.w * 0.62, face.h * 0.95, 0, 0, Math.PI * 2);
+      mg.fill();
+      const neckW = face.w * 0.52;
+      mg.fillRect(colW / 2 - neckW / 2, chinY - face.h * 0.3 - top, neckW, neckY - chinY + face.h * 0.3);
+      mg.filter = 'none';
+      mg.globalCompositeOperation = 'destination-in';        // fade out below the split point
+      const vy = mg.createLinearGradient(0, 0, 0, colH);
+      vy.addColorStop(0, '#000'); vy.addColorStop(Math.min(1, (neckY - top) / colH), '#000');
+      vy.addColorStop(1, 'rgba(0,0,0,0)');
+      mg.fillStyle = vy; mg.fillRect(0, 0, colW, colH);
+      mg.globalCompositeOperation = 'source-over';
+
+      col.width = colW; col.height = colH;
+      cg.drawImage(video, colX, colY, colW, colH, 0, 0, colW, colH);
+      cg.globalCompositeOperation = 'destination-in';
+      cg.drawImage(mask, 0, 0);
+      cg.globalCompositeOperation = 'source-over';
+
+      const spread = face.w * 1.1, droop = face.h * 0.15;
+      const rise = neckY - (chinY - face.h * 0.1);           // branch over the length of the neck
+      const strip = 2;
+      const copy = k => {
+        for (let y = 0; y < colH; y += strip) {
+          const t = Math.max(0, Math.min(1, (neckY - (colY + y)) / rise));
+          const e = t * t * (3 - 2 * t);
+          g.drawImage(col, 0, y, colW, strip, colX + k * spread * e, colY + y + Math.abs(k) * droop * e, colW, strip);
+        }
+      };
+      copy(-1); copy(1); copy(0);
+    }
+
+    function frame(now) {
+      requestAnimationFrame(frame);
+      if (!(video.readyState >= 2 && video.videoWidth)) return;
+      if (out.width !== video.videoWidth || out.height !== video.videoHeight) {
+        out.width = video.videoWidth; out.height = video.videoHeight;
+      }
+      g.drawImage(video, 0, 0);
+      if (!heads) return;
+      try { trackFace(now); } catch (err) { console.warn('face tracking failed', err); }
+      if (face) drawHeads();
+    }
+
+    picker.addEventListener('change', () => start(picker.value));
+    document.getElementById('heads').addEventListener('click', e => {
+      heads = !heads;
+      e.target.textContent = `Three heads: ${heads ? 'on' : 'off'}`;
+    });
+    document.getElementById('mirror').addEventListener('click', e => {
+      const on = out.classList.toggle('mirror');
+      e.target.textContent = `Mirror: ${on ? 'on' : 'off'}`;
+    });
+    document.getElementById('snap').addEventListener('click', () => {
+      if (!out.width) return;
+      const shot = document.createElement('canvas');
+      shot.width = out.width; shot.height = out.height;
+      const s = shot.getContext('2d');
+      if (out.classList.contains('mirror')) { s.translate(shot.width, 0); s.scale(-1, 1); }
+      s.drawImage(out, 0, 0);
+      const a = document.createElement('a');
+      a.href = shot.toDataURL('image/png');
+      a.download = `snapshot-${new Date().toISOString().replace(/[:.]/g, '-')}.png`;
+      a.click();
+    });
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      show('This browser can’t access the camera here. Open the page from http://localhost.');
+    } else {
+      loadDetector();
+      start();
+      requestAnimationFrame(frame);
+    }
+  </script>
+</body>
+</html>
