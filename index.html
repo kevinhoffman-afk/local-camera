@@ -6,9 +6,12 @@
   <title>Camera</title>
   <style>
     html, body { margin: 0; height: 100%; background: #000; color: #fff; font: 14px/1.4 system-ui, sans-serif; }
-    video { display: none; }
-    canvas { width: 100%; height: 100%; object-fit: contain; display: block; }
-    canvas.mirror { transform: scaleX(-1); }
+    .stage { position: fixed; inset: 0; }
+    .stage.mirror { transform: scaleX(-1); }
+    .stage video, .stage canvas {
+      position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: block;
+    }
+    .stage video { filter: saturate(0.3); }          /* muted, so the blue line stands out */
     .bar {
       position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%);
       display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: center;
@@ -25,32 +28,43 @@
       text-align: center; padding: 16px; pointer-events: none;
     }
     .msg[hidden] { display: none; }
-    .status { position: fixed; top: 12px; left: 12px; font-size: 12px; opacity: 0.7; }
+    .status { position: fixed; top: 12px; left: 12px; font-size: 12px; opacity: 0.75; }
   </style>
 </head>
 <body>
-  <video id="video" autoplay playsinline muted></video>
-  <canvas id="out" class="mirror"></canvas>
+  <div id="stage" class="stage mirror">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="ink"></canvas>
+  </div>
   <div id="msg" class="msg">Starting camera…</div>
   <div id="status" class="status"></div>
   <div class="bar">
     <select id="cameras" aria-label="Camera" hidden></select>
-    <button id="effect" type="button">Effect: on</button>
+    <button id="undo" type="button">Undo</button>
+    <button id="clear" type="button">Clear</button>
     <button id="mirror" type="button">Mirror: on</button>
     <button id="snap" type="button">Snapshot</button>
   </div>
 
   <script type="module">
-    import { FaceDetector, ImageSegmenter, FilesetResolver } from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs';
+    import { HandLandmarker, FilesetResolver } from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs';
+
+    const INK = '#0038ff';                             // primary blue
+    const HINT = 'Point with one finger to draw · raise two fingers to lift the pen';
 
     const video = document.getElementById('video');
-    const out = document.getElementById('out');
+    const ink = document.getElementById('ink');
+    const g = ink.getContext('2d');
+    const stage = document.getElementById('stage');
     const msg = document.getElementById('msg');
     const status = document.getElementById('status');
     const picker = document.getElementById('cameras');
-    let stream = null, detector = null, segmenter = null, effect = true;
-    let face = null;                                   // smoothed face box in video pixels
-    let lastTs = 0;                                    // the models need increasing timestamps
+    let stream = null, hands = null, lastTs = 0;
+
+    // Strokes are lists of points in video pixels, so they stay put when the window resizes.
+    let strokes = [], current = null;
+    let tip = null;                                    // smoothed fingertip
+    let penDown = false, downVotes = 0;                // pen state, debounced over a few frames
 
     function show(text) { msg.textContent = text; msg.hidden = !text; }
 
@@ -81,448 +95,139 @@
       picker.hidden = devices.length < 2;
     }
 
-    // ---------- tracking: face box + person silhouette ----------
-    async function loadModels() {
-      status.textContent = 'Loading face tracking…';
+    // ---------- hand tracking ----------
+    async function loadHands() {
+      status.textContent = 'Loading hand tracking…';
       try {
         const vision = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
-        [detector, segmenter] = await Promise.all([
-          FaceDetector.createFromOptions(vision, {
-            baseOptions: {
-              modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite',
-              delegate: 'GPU',
-            },
-            runningMode: 'VIDEO',
-          }),
-          ImageSegmenter.createFromOptions(vision, {
-            baseOptions: {
-              modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/1/selfie_segmenter.tflite',
-              delegate: 'GPU',
-            },
-            runningMode: 'VIDEO',
-            outputConfidenceMasks: true,
-            outputCategoryMask: false,
-          }).catch(() => null),
-        ]);
-        status.textContent = segmenter ? '' : 'Body outline unavailable — the effect needs it';
+        hands = await HandLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+            delegate: 'GPU',
+          },
+          runningMode: 'VIDEO',
+          numHands: 1,
+        });
+        status.textContent = HINT;
       } catch (err) {
-        status.textContent = 'Tracking unavailable — check your connection and reload';
+        status.textContent = 'Hand tracking unavailable — check your connection and reload';
       }
     }
 
-    function trackFace(ts) {
-      const W = video.videoWidth, H = video.videoHeight;
-      let box = null;
-      if (detector) {
-        const d = detector.detectForVideo(video, ts).detections[0];
-        if (d) box = d.boundingBox;
+    // A finger counts as raised when its tip is clearly farther from the wrist than its middle joint.
+    const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+    const raised = (lm, tipI, pipI) => dist(lm[0], lm[tipI]) > dist(lm[0], lm[pipI]) * 1.15;
+
+    function track(now) {
+      if (!hands) return;
+      lastTs = Math.max(now, lastTs + 1);
+      const lm = hands.detectForVideo(video, lastTs).landmarks[0];
+      let wantDown = false;
+      if (lm) {
+        const W = video.videoWidth, H = video.videoHeight;
+        const raw = { x: lm[8].x * W, y: lm[8].y * H };        // index fingertip
+        // smooth more when the finger is still (less jitter), less when it moves fast (less lag)
+        if (!tip) tip = { ...raw };
+        const speed = Math.hypot(raw.x - tip.x, raw.y - tip.y);
+        const k = Math.min(1, 0.25 + speed / (W * 0.03));
+        tip.x += (raw.x - tip.x) * k; tip.y += (raw.y - tip.y) * k;
+        wantDown = raised(lm, 8, 6) && !raised(lm, 12, 10);   // pointing: index up, middle down
+      } else {
+        tip = null;
       }
-      if (!box && !face) box = { originX: W * 0.4, originY: H * 0.2, width: W * 0.2, height: W * 0.2 };
-      if (!box) return;                                // keep the last position for a moment
-      if (!face) { face = { x: box.originX, y: box.originY, w: box.width, h: box.height }; return; }
-      const k = 0.35;                                  // smooth out detector jitter
-      face.x += (box.originX - face.x) * k; face.y += (box.originY - face.y) * k;
-      face.w += (box.width - face.w) * k;   face.h += (box.height - face.h) * k;
+      downVotes = Math.max(-2, Math.min(2, downVotes + (wantDown ? 1 : -1)));
+      const next = downVotes >= 2 ? true : downVotes <= -2 ? false : penDown;
+      if (next && !penDown) { current = [{ ...tip }]; strokes.push(current); }
+      if (!next) current = null;
+      penDown = next;
+      if (penDown && current && tip) {
+        const last = current[current.length - 1];
+        if (Math.hypot(tip.x - last.x, tip.y - last.y) > 1.5) current.push({ ...tip });
+      }
     }
 
-    // The silhouette is computed on a small copy of the frame; the GPU smooths it back up.
-    const small = document.createElement('canvas');
-    const sg = small.getContext('2d', { willReadFrequently: true });
-    let maskBytes = null, maskW = 0, maskH = 0;
-    function trackPerson(ts) {
-      if (!segmenter) return false;
-      const w = 256, h = Math.round(256 * video.videoHeight / video.videoWidth);
-      if (small.width !== w || small.height !== h) { small.width = w; small.height = h; }
-      sg.drawImage(video, 0, 0, w, h);
-      const result = segmenter.segmentForVideo(small, ts);
-      const mask = result.confidenceMasks && result.confidenceMasks[0];
-      if (mask) {
-        const f = mask.getAsFloat32Array();
-        if (!maskBytes || maskBytes.length !== f.length) maskBytes = new Uint8Array(f.length);
-        for (let i = 0; i < f.length; i++) maskBytes[i] = f[i] * 255;
-        maskW = mask.width; maskH = mask.height;
-      }
-      result.close();
-      return !!mask;
-    }
-
-    // ---------- GPU passes ----------
-    // 1. FIGURE: build the three-headed figure from the frame. One neck forks into three
-    //    (a smooth union of three tapered branches, skinned with the real neck stretched
-    //    over each), the collar stretches around the wider base, and the heads sit on top.
-    //    Colour goes in rgb, how much of each pixel is the figure goes in alpha.
-    // 2. GLOW: halo around the figure plus flickering horizontal streaks, keeping part of
-    //    last frame's glow so it trails and drifts up as you move.
-    // 3. AURA: grainy burnt-orange field, white-hot glow fading to yellow and orange, and
-    //    the figure itself as an inverted teal-black silhouette.
-    // Render targets store rows bottom-up, so passes read them back at (u, 1 - v).
-    const gl = out.getContext('webgl', { preserveDrawingBuffer: true, premultipliedAlpha: false });
-    const VERT = `
-      attribute vec2 aPos; varying vec2 vUv;
-      void main() { vUv = vec2(aPos.x * 0.5 + 0.5, 0.5 - aPos.y * 0.5); gl_Position = vec4(aPos, 0.0, 1.0); }`;
-
-    const FIGURE = `
-      precision highp float;
-      varying vec2 vUv;
-      uniform sampler2D uVideo, uMask, uVidL, uMaskL, uVidR, uMaskR;
-      uniform vec2 uRes, uMaskTexel;
-      uniform float uCx, uFaceTop, uChin, uNeck, uFw, uFh, uOn;
-      uniform float uLift;             // how much taller the neck is: every head rises by this much
-      // The side heads are their own creatures: each is cut from an older frame (its face
-      // box there is uFace*: centre x, top, chin, width) and placed where its own neck
-      // ends now (uHead*: x, y, tilt, scale), optionally mirrored.
-      uniform vec4 uHeadL, uHeadR, uFaceL, uFaceR;
-      uniform float uMirL, uMirR;
-
-      // Person coverage. Caps and hair come back with weaker confidence, so on the top of
-      // the head the threshold drops and the mask reaches one texel further.
-      float person(sampler2D m, vec2 p, float faceTop) {
-        float v = texture2D(m, p / uRes).r;
-        float cap = smoothstep(faceTop + uFh * 0.25, faceTop - uFh * 0.05, p.y);
-        if (cap > 0.0) {
-          vec2 o = uMaskTexel * 1.2;
-          vec2 uv = p / uRes;
-          float n = max(max(texture2D(m, uv + vec2(o.x, 0.0)).r, texture2D(m, uv - vec2(o.x, 0.0)).r),
-                        max(texture2D(m, uv - vec2(0.0, o.y)).r, texture2D(m, uv + vec2(0.0, o.y)).r));
-          v = max(v, n * cap);
+    // ---------- drawing ----------
+    function lineWidth() { return Math.max(2, video.videoWidth * 0.0035); }
+    function drawStrokes(ctx) {
+      ctx.strokeStyle = INK; ctx.lineWidth = lineWidth();
+      ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      for (const s of strokes) {
+        if (s.length === 1) {                                 // a tap leaves a dot
+          ctx.fillStyle = INK;
+          ctx.beginPath(); ctx.arc(s[0].x, s[0].y, ctx.lineWidth / 2, 0, Math.PI * 2); ctx.fill();
+          continue;
         }
-        return smoothstep(mix(0.3, 0.06, cap), mix(0.7, 0.38, cap), v);
-      }
-      // the head down to just under the jaw; f = (centre x, top, chin, width)
-      float headPart(sampler2D m, vec2 p, vec4 f) {
-        float above = 1.0 - smoothstep(f.z - uFh * 0.14, f.z + uFh * 0.1, p.y);
-        float column = 1.0 - smoothstep(f.w * 1.0, f.w * 1.3, abs(p.x - f.x));   // wide enough for cap brims
-        return above * column * person(m, p, f.y);
-      }
-      vec4 sideHead(sampler2D vid, sampler2D m, vec2 p, vec4 h, float mir, vec4 f) {
-        vec2 l = p - h.xy;
-        float c = cos(h.z), s = sin(h.z);
-        l = vec2(c * l.x + s * l.y, -s * l.x + c * l.y) / h.w;
-        l.x *= mir;
-        vec2 src = vec2(f.x, f.z - uFh * 0.02) + l;
-        return vec4(texture2D(vid, src / uRes).rgb, headPart(m, src, f));
-      }
-      float smin(float a, float b, float k) {
-        float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
-        return mix(b, a, h) - k * h * (1.0 - h);
-      }
-
-      void main() {
-        vec2 p = vUv * uRes;
-        vec4 fNow = vec4(uCx, uFaceTop, uChin, uFw);
-        if (uOn < 0.5) { gl_FragColor = vec4(texture2D(uVideo, vUv).rgb, person(uMask, p, uFaceTop)); return; }
-        float rb = uFw * 0.5, rt = uFw * 0.29, rn = uFw * 0.27;     // base, top and real neck half-widths
-        vec2 base = vec2(uCx, uNeck + uFh * 0.1);
-        float realTop = uChin + uFh * 0.06, realBot = uNeck;
-
-        // shirt and collar stretch around the wider neck base
-        float band = smoothstep(uNeck - uFh * 0.5, uNeck, p.y) * (1.0 - smoothstep(uNeck, uNeck + uFh * 1.6, p.y));
-        float g = exp(-pow((p.x - uCx) / (uFw * 1.3), 2.0));
-        vec2 q = vec2(uCx + (p.x - uCx) / (1.0 + (rb / rn - 1.0) * band * g), p.y);
-        vec3 col = texture2D(uVideo, q / uRes).rgb;
-        // only the body below the jaw stays where it is; the head is redrawn higher up
-        float fig = person(uMask, q, uFaceTop) * smoothstep(uChin - uFh * 0.05, uChin + uFh * 0.3, q.y);
-
-        // one neck forking into three, each branch reaching up to its head
-        float dU = 0.0, dMin = 1e5, wsum = 0.0;
-        vec3 skin = vec3(0.0);
-        for (int i = 0; i < 3; i++) {
-          vec2 top = i == 0 ? uHeadL.xy : (i == 1 ? vec2(uCx, uChin - uFh * 0.02 - uLift) : uHeadR.xy);
-          float rTop = rt * (i == 0 ? uHeadL.w : (i == 1 ? 1.0 : uHeadR.w));
-          vec2 ab = top - base;
-          float s = clamp(dot(p - base, ab) / dot(ab, ab), 0.0, 1.0);
-          vec2 c = base + ab * s;
-          vec2 n = normalize(vec2(-ab.y, ab.x));
-          float r = mix(rb, rTop, s);
-          float u = dot(p - c, n);
-          float d = length(p - c) - r;
-          dU = i == 0 ? d : smin(dU, d, uFw * 0.35);
-          dMin = min(dMin, d);
-          // skin from the real neck: across the branch -> across the neck, along -> up it
-          vec2 src = vec2(uCx + clamp(u / r, -1.0, 1.0) * rn, mix(realBot, realTop, s));
-          float w = exp(-max(d, 0.0) / (uFw * 0.06)) + 1e-4;
-          float shade = 1.0 - 0.3 * pow(clamp(abs(u) / r, 0.0, 1.0), 2.0);   // rounded shading
-          shade *= 1.0 - 0.3 * smoothstep(0.7, 1.0, s);                        // shadow under the jaw
-          skin += texture2D(uVideo, src / uRes).rgb * shade * w;
-          wsum += w;
+        ctx.beginPath(); ctx.moveTo(s[0].x, s[0].y);
+        for (let i = 1; i < s.length - 1; i++) {              // curve through midpoints for a smooth line
+          const mx = (s[i].x + s[i + 1].x) / 2, my = (s[i].y + s[i + 1].y) / 2;
+          ctx.quadraticCurveTo(s[i].x, s[i].y, mx, my);
         }
-        skin /= wsum;
-        skin *= 0.8;                                                           // necks a touch darker
-        skin *= 1.0 - 0.3 * clamp((dMin - dU) / (uFw * 0.12), 0.0, 1.0);    // shadow in the forks
-        float neckA = 1.0 - smoothstep(-uFw * 0.04, uFw * 0.04, dU);
-        neckA *= smoothstep(base.y + uFh * 0.05, base.y - uFh * 0.3, p.y);   // melt into the collar
-        col = mix(col, skin, neckA);
-        fig = max(fig, neckA);
-
-        // the two other heads, then the real head on top
-        vec4 hl = sideHead(uVidL, uMaskL, p, uHeadL, uMirL, uFaceL);
-        col = mix(col, hl.rgb, hl.a); fig = max(fig, hl.a);
-        vec4 hr = sideHead(uVidR, uMaskR, p, uHeadR, uMirR, uFaceR);
-        col = mix(col, hr.rgb, hr.a); fig = max(fig, hr.a);
-        vec2 hp = p + vec2(0.0, uLift);
-        float a = headPart(uMask, hp, fNow);
-        col = mix(col, texture2D(uVideo, hp / uRes).rgb, a); fig = max(fig, a);
-        gl_FragColor = vec4(col, fig);
-      }`;
-
-    const GLOW = `
-      precision highp float;
-      varying vec2 vUv;
-      uniform sampler2D uFig, uPrev;
-      uniform vec2 uRes;
-      uniform float uTime;
-      float hash(float n) { return fract(sin(n) * 43758.5453); }
-      float noise(float x) { float i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f); return mix(hash(i), hash(i + 1.0), f); }
-      float fig(vec2 uv) { return texture2D(uFig, vec2(uv.x, 1.0 - uv.y)).a; }
-      void main() {
-        vec2 uv = vUv;
-        float aspect = uRes.x / uRes.y;
-        // soft halo: how much figure sits within growing rings around this pixel
-        float halo = 0.0;
-        for (int r = 1; r <= 3; r++) {
-          float rad = float(r) * 0.028;
-          float sum = 0.0;
-          for (int i = 0; i < 10; i++) {
-            float a = float(i) * 0.6283 + float(r) * 1.3;
-            sum += fig(uv + vec2(cos(a) / aspect, sin(a)) * rad);
-          }
-          halo = max(halo, sum / 10.0 * (1.2 - float(r) * 0.2));
-        }
-        // horizontal streaks: each row reaches out a flickering distance
-        float row = uv.y * 70.0;
-        float len = pow(noise(row + uTime * 2.5) * 0.65 + noise(row * 2.7 - uTime * 6.0) * 0.35, 2.2) * 0.42;
-        float streak = 0.0;
-        for (int j = 1; j <= 10; j++) {
-          float d = len * float(j) / 10.0;
-          float w = 1.0 - float(j) / 11.0;
-          streak = max(streak, max(fig(uv + vec2(d, 0.0)), fig(uv - vec2(d, 0.0))) * w);
-        }
-        float v = max(max(halo * 1.5, streak), fig(uv));
-        // trails: keep some of last frame's glow, drifting upward
-        float prev = texture2D(uPrev, vec2(uv.x, 1.0 - uv.y - 2.0 / uRes.y)).r;
-        v = max(v, prev * 0.88);
-        gl_FragColor = vec4(v, v, v, 1.0);
-      }`;
-
-    const AURA = `
-      precision highp float;
-      varying vec2 vUv;
-      uniform sampler2D uFig, uGlow, uVideo;
-      uniform vec2 uRes;
-      uniform float uTime, uOn;
-      float hash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
-      void main() {
-        vec2 uv = vUv;
-        if (uOn < 0.5) { gl_FragColor = vec4(texture2D(uVideo, uv).rgb, 1.0); return; }
-        vec4 f = texture2D(uFig, vec2(uv.x, 1.0 - uv.y));
-        float g = texture2D(uGlow, vec2(uv.x, 1.0 - uv.y)).r;
-        // burnt-orange field, lighter in the middle
-        vec3 col = mix(vec3(0.55, 0.24, 0.11), vec3(0.76, 0.38, 0.19), smoothstep(0.9, 0.1, length((uv - 0.5) * vec2(1.0, 1.3))));
-        // glow: orange -> yellow -> white-hot next to the body
-        vec3 hot = mix(vec3(0.98, 0.64, 0.24), vec3(0.97, 0.94, 0.89), smoothstep(0.42, 0.78, g));
-        col = mix(col, hot, smoothstep(0.1, 0.32, g));
-        // the figure as an inverted teal-black silhouette with soft edges
-        float L = 1.0 - dot(f.rgb, vec3(0.299, 0.587, 0.114));
-        vec3 body = mix(vec3(0.02, 0.06, 0.07), vec3(0.1, 0.28, 0.32), smoothstep(0.25, 0.6, L));
-        body = mix(body, vec3(0.9, 0.88, 0.82), smoothstep(0.66, 0.92, L));
-        col = mix(col, body, smoothstep(0.35, 0.85, f.a));
-        // film grain
-        col += (hash(uv * uRes + fract(uTime) * 91.7) - 0.5) * 0.1;
-        gl_FragColor = vec4(col, 1.0);
-      }`;
-
-    function compile(type, src) {
-      const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
-      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
-      return s;
-    }
-    function program(frag, uniforms) {
-      const prog = gl.createProgram();
-      gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
-      gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, frag));
-      gl.linkProgram(prog);
-      if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
-      const u = { prog, aPos: gl.getAttribLocation(prog, 'aPos') };
-      for (const n of uniforms) u[n] = gl.getUniformLocation(prog, n);
-      return u;
-    }
-    function texture() {
-      const t = gl.createTexture();
-      gl.bindTexture(gl.TEXTURE_2D, t);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      return t;
-    }
-    function target(w, h) {
-      const tex = texture();
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-      const fb = gl.createFramebuffer();
-      gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
-      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-      return { tex, fb, w, h };
-    }
-
-    // Recent frames (video, silhouette, face box) so the side heads can live in the past.
-    const SLOTS = 20;
-    let ring = [], ringI = 0, filled = 0;
-    // The two other heads: how far behind they are (frames), whether they're mirrored, and
-    // their own drift, sway and tilt. Each follows the body through its own springy lag.
-    const others = [
-      { k: -1, delay: 7,  mirror: 1,  scale: 0.95, freq: 0.9, phase: 0.0, pos: null, vel: [0, 0], tilt: 0 },
-      { k: 1,  delay: 14, mirror: -1, scale: 1.03, freq: 0.7, phase: 2.1, pos: null, vel: [0, 0], tilt: 0 },
-    ];
-    let lastNow = 0;
-    const LIFT = 0.5;                  // neck lengthening, in face heights
-
-    let P, figT, glowT = [], glowI = 0;
-    function setupGL() {
-      P = {
-        figure: program(FIGURE, ['uVideo', 'uMask', 'uVidL', 'uMaskL', 'uVidR', 'uMaskR', 'uRes', 'uMaskTexel',
-          'uCx', 'uFaceTop', 'uChin', 'uNeck', 'uFw', 'uFh', 'uOn', 'uLift', 'uHeadL', 'uHeadR', 'uFaceL', 'uFaceR', 'uMirL', 'uMirR']),
-        glow: program(GLOW, ['uFig', 'uPrev', 'uRes', 'uTime']),
-        aura: program(AURA, ['uFig', 'uGlow', 'uVideo', 'uRes', 'uTime', 'uOn']),
-      };
-      gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
-      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
-      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-      ring = Array.from({ length: SLOTS }, () => ({ vid: texture(), mask: texture(), face: null }));
-    }
-    function resizeTargets(W, H) {
-      figT = target(W, H);
-      const gw = Math.round(W / 2), gh = Math.round(H / 2);
-      glowT = [target(gw, gh), target(gw, gh)];
-      filled = 0;
-    }
-    function use(p, fb, w, h, textures) {
-      gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
-      gl.viewport(0, 0, w, h);
-      gl.useProgram(p.prog);
-      gl.enableVertexAttribArray(p.aPos);
-      gl.vertexAttribPointer(p.aPos, 2, gl.FLOAT, false, 0, 0);
-      textures.forEach(([name, tex], i) => {
-        gl.activeTexture(gl.TEXTURE0 + i); gl.bindTexture(gl.TEXTURE_2D, tex); gl.uniform1i(p[name], i);
-      });
-    }
-    const past = n => ring[(ringI - 1 - Math.min(n, filled - 1) + SLOTS * 2) % SLOTS];
-
-    // Each other head drifts toward its spot beside the real one through a loose spring,
-    // bobs and sways on its own rhythm, and leans into the way it's being dragged.
-    function moveOthers(dt, t) {
-      const cx = face.x + face.w / 2, chin = face.y + face.h;
-      for (const o of others) {
-        const target = [cx + o.k * face.w * 1.15 + Math.sin(t * o.freq + o.phase) * face.w * 0.08,
-                        chin - face.h * 0.02 + face.h * 0.15 - face.h * LIFT + Math.sin(t * o.freq * 1.3 + o.phase) * face.h * 0.05];
-        if (!o.pos) o.pos = target.slice();
-        const K = 22, C = 2 * 0.45 * Math.sqrt(K);
-        for (let i = 0; i < 2; i++) {
-          o.vel[i] += (K * (target[i] - o.pos[i]) - C * o.vel[i]) * dt;
-          o.pos[i] += o.vel[i] * dt;
-        }
-        o.tilt = o.k * 0.14 + 0.09 * Math.sin(t * o.freq * 0.8 + o.phase * 1.7)
-               - Math.max(-0.3, Math.min(0.3, o.vel[0] / (face.w * 8)));
+        const e = s[s.length - 1];
+        ctx.lineTo(e.x, e.y);
+        ctx.stroke();
       }
+    }
+    function drawCursor() {
+      if (!tip) return;
+      const r = lineWidth() * 2.2;
+      g.lineWidth = Math.max(1.5, lineWidth() * 0.45);
+      g.strokeStyle = INK; g.fillStyle = INK;
+      g.beginPath(); g.arc(tip.x, tip.y, r, 0, Math.PI * 2);
+      if (penDown) g.fill(); else g.stroke();
     }
 
     function frame(now) {
       requestAnimationFrame(frame);
       if (!(video.readyState >= 2 && video.videoWidth)) return;
-      const W = video.videoWidth, H = video.videoHeight;
-      if (out.width !== W || out.height !== H) { out.width = W; out.height = H; resizeTargets(W, H); }
-      const dt = Math.min(0.05, Math.max(0.001, (now - lastNow) / 1000)); lastNow = now;
-
-      let hasMask = false;
-      if (effect) {
-        lastTs = Math.max(now, lastTs + 1);
-        try { trackFace(lastTs); } catch (err) { console.warn('face tracking failed', err); }
-        try { hasMask = trackPerson(lastTs); } catch (err) { console.warn('outline tracking failed', err); }
+      if (ink.width !== video.videoWidth || ink.height !== video.videoHeight) {
+        ink.width = video.videoWidth; ink.height = video.videoHeight;
       }
-      // store this frame in the ring
-      const slot = ring[ringI];
-      gl.bindTexture(gl.TEXTURE_2D, slot.vid);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
-      gl.bindTexture(gl.TEXTURE_2D, slot.mask);
-      if (maskBytes) gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, maskW, maskH, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE, maskBytes);
-      else gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, 1, 1, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE, new Uint8Array(1));
-      slot.face = face ? { ...face } : null;
-      ringI = (ringI + 1) % SLOTS; filled = Math.min(SLOTS, filled + 1);
-
-      const on = effect && face && maskBytes ? 1 : 0;
-      const t = now / 1000;
-      if (face) moveOthers(dt, t);
-
-      const L = past(others[0].delay), R = past(others[1].delay);
-      use(P.figure, figT.fb, W, H, [['uVideo', slot.vid], ['uMask', slot.mask],
-        ['uVidL', L.vid], ['uMaskL', L.mask], ['uVidR', R.vid], ['uMaskR', R.mask]]);
-      gl.uniform2f(P.figure.uRes, W, H);
-      gl.uniform2f(P.figure.uMaskTexel, 1 / Math.max(1, maskW), 1 / Math.max(1, maskH));
-      gl.uniform1f(P.figure.uOn, on);
-      if (face) {
-        const chin = face.y + face.h;
-        gl.uniform1f(P.figure.uCx, face.x + face.w / 2);
-        gl.uniform1f(P.figure.uFaceTop, face.y);
-        gl.uniform1f(P.figure.uChin, chin);
-        gl.uniform1f(P.figure.uNeck, Math.min(H, chin + face.h * 0.55));
-        gl.uniform1f(P.figure.uFw, face.w);
-        gl.uniform1f(P.figure.uFh, face.h);
-        gl.uniform1f(P.figure.uLift, face.h * LIFT);
-        const setOther = (o, s, headU, faceU, mirU) => {
-          const f = s.face || face;
-          gl.uniform4f(P.figure[headU], o.pos[0], o.pos[1], o.tilt, o.scale);
-          gl.uniform4f(P.figure[faceU], f.x + f.w / 2, f.y, f.y + f.h, f.w);
-          gl.uniform1f(P.figure[mirU], o.mirror);
-        };
-        setOther(others[0], L, 'uHeadL', 'uFaceL', 'uMirL');
-        setOther(others[1], R, 'uHeadR', 'uFaceR', 'uMirR');
-      }
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-
-      const cur = glowT[glowI], prev = glowT[1 - glowI];
-      use(P.glow, cur.fb, cur.w, cur.h, [['uFig', figT.tex], ['uPrev', prev.tex]]);
-      gl.uniform2f(P.glow.uRes, cur.w, cur.h);
-      gl.uniform1f(P.glow.uTime, t);
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-      glowI = 1 - glowI;
-
-      use(P.aura, null, W, H, [['uFig', figT.tex], ['uGlow', cur.tex], ['uVideo', slot.vid]]);
-      gl.uniform2f(P.aura.uRes, W, H);
-      gl.uniform1f(P.aura.uTime, t);
-      gl.uniform1f(P.aura.uOn, on);
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      try { track(now); } catch (err) { console.warn('hand tracking failed', err); }
+      g.clearRect(0, 0, ink.width, ink.height);
+      drawStrokes(g);
+      drawCursor();
     }
 
     // ---------- controls ----------
     picker.addEventListener('change', () => start(picker.value));
-    document.getElementById('effect').addEventListener('click', e => {
-      effect = !effect;
-      e.target.textContent = `Effect: ${effect ? 'on' : 'off'}`;
-    });
+    document.getElementById('undo').addEventListener('click', () => { strokes.pop(); current = null; });
+    document.getElementById('clear').addEventListener('click', () => { strokes = []; current = null; });
     document.getElementById('mirror').addEventListener('click', e => {
-      const on = out.classList.toggle('mirror');
+      const on = stage.classList.toggle('mirror');
       e.target.textContent = `Mirror: ${on ? 'on' : 'off'}`;
     });
+    // Snapshot: the muted frame with the drawing on top, flipped like the screen.
     document.getElementById('snap').addEventListener('click', () => {
-      if (!out.width) return;
+      const W = video.videoWidth, H = video.videoHeight;
+      if (!W) return;
       const shot = document.createElement('canvas');
-      shot.width = out.width; shot.height = out.height;
+      shot.width = W; shot.height = H;
       const s = shot.getContext('2d');
-      if (out.classList.contains('mirror')) { s.translate(shot.width, 0); s.scale(-1, 1); }
-      s.drawImage(out, 0, 0);
+      s.drawImage(video, 0, 0);
+      const img = s.getImageData(0, 0, W, H), d = img.data;
+      for (let i = 0; i < d.length; i += 4) {                 // same 30% saturation as the screen
+        const l = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+        d[i] = l + (d[i] - l) * 0.3; d[i + 1] = l + (d[i + 1] - l) * 0.3; d[i + 2] = l + (d[i + 2] - l) * 0.3;
+      }
+      s.putImageData(img, 0, 0);
+      drawStrokes(s);
+      let outCanvas = shot;
+      if (stage.classList.contains('mirror')) {
+        outCanvas = document.createElement('canvas');
+        outCanvas.width = W; outCanvas.height = H;
+        const m = outCanvas.getContext('2d');
+        m.translate(W, 0); m.scale(-1, 1); m.drawImage(shot, 0, 0);
+      }
       const a = document.createElement('a');
-      a.href = shot.toDataURL('image/png');
-      a.download = `snapshot-${new Date().toISOString().replace(/[:.]/g, '-')}.png`;
+      a.href = outCanvas.toDataURL('image/png');
+      a.download = `drawing-${new Date().toISOString().replace(/[:.]/g, '-')}.png`;
       a.click();
     });
 
     if (!navigator.mediaDevices?.getUserMedia) {
       show('This browser can’t access the camera here. Open the page from http://localhost.');
-    } else if (!gl) {
-      show('This browser doesn’t support WebGL, which the effect needs.');
     } else {
-      setupGL();
-      loadModels();
+      loadHands();
       start();
       requestAnimationFrame(frame);
     }
