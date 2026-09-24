@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Laser Eyes</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #000; color: #fff; font: 15px/1.45 system-ui, sans-serif; }
+    video { display: none; }
+    canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+    .hud {
+      position: fixed; top: 12px; left: 12px; right: 12px; display: flex; justify-content: space-between;
+      font-weight: 700; font-size: 20px; text-shadow: 0 2px 6px rgba(0, 0, 0, 0.7); pointer-events: none;
+    }
+    .panel {
+      position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; padding: 16px;
+      background: rgba(0, 0, 0, 0.55);
+    }
+    .panel[hidden] { display: none; }
+    .card {
+      max-width: 420px; width: 100%; box-sizing: border-box; padding: 24px; border-radius: 16px;
+      background: rgba(20, 20, 24, 0.92); text-align: center;
+    }
+    .card h1 { margin: 0 0 8px; font-size: 28px; color: #ff3b30; letter-spacing: 0.02em; }
+    .card p { margin: 8px 0; color: #ddd; }
+    .row { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; margin-top: 16px; }
+    button {
+      font: inherit; font-weight: 600; color: #fff; background: #ff3b30; border: 0;
+      border-radius: 10px; padding: 10px 18px; cursor: pointer;
+    }
+    button.quiet { background: #333; }
+    .bar {
+      position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%);
+      display: flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: center;
+      padding: 8px 12px; border-radius: 12px; background: rgba(0, 0, 0, 0.55); font-size: 13px;
+      max-width: calc(100% - 32px); box-sizing: border-box;
+    }
+    .bar label { display: flex; gap: 6px; align-items: center; }
+    .bar button { padding: 6px 10px; font-size: 13px; background: #333; }
+    .status { position: fixed; top: 44px; left: 12px; font-size: 12px; opacity: 0.75; pointer-events: none; }
+  </style>
+</head>
+<body>
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="c"></canvas>
+  <div class="hud"><span id="score">0 zapped</span><span id="time"></span></div>
+  <div id="status" class="status"></div>
+
+  <div id="panel" class="panel">
+    <div class="card">
+      <h1>Laser Eyes</h1>
+      <p id="panelText">Mosquitoes are buzzing around your window. Look at them to fire the lasers in your eyes.</p>
+      <div class="row">
+        <button id="play" type="button">Play</button>
+        <button id="playMouse" class="quiet" type="button">Play with mouse</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="bar">
+    <label>Aim sensitivity <input id="sens" type="range" min="0.5" max="2" step="0.05" value="1"></label>
+    <button id="recal" type="button">Recalibrate</button>
+  </div>
+
+  <script type="module">
+    import { FaceLandmarker, FilesetResolver } from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs';
+
+    const ROUND = 60;                                  // seconds per round
+    const video = document.getElementById('video');
+    const c = document.getElementById('c');
+    const g = c.getContext('2d');
+    const panel = document.getElementById('panel');
+    const panelText = document.getElementById('panelText');
+    const status = document.getElementById('status');
+    const scoreEl = document.getElementById('score');
+    const timeEl = document.getElementById('time');
+    const sensEl = document.getElementById('sens');
+
+    let SW = 0, SH = 0, DPR = 1;
+    function resize() {
+      DPR = window.devicePixelRatio || 1;
+      SW = innerWidth; SH = innerHeight;
+      c.width = SW * DPR; c.height = SH * DPR;
+      g.setTransform(DPR, 0, 0, DPR, 0, 0);
+    }
+    resize();
+    addEventListener('resize', resize);
+
+    // ---------- camera + face tracking ----------
+    let stream = null, faces = null, lastTs = 0;
+    async function startCamera() {
+      stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+      video.srcObject = stream;
+      await video.play();
+    }
+    async function loadFaces() {
+      status.textContent = 'Loading eye tracking…';
+      const vision = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+      faces = await FaceLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+          delegate: 'GPU',
+        },
+        runningMode: 'VIDEO',
+        numFaces: 1,
+      });
+      status.textContent = '';
+    }
+
+    // The video fills the screen (cropped to cover) and is mirrored like a selfie view.
+    function videoBox() {
+      const W = video.videoWidth || 16, H = video.videoHeight || 9;
+      const s = Math.max(SW / W, SH / H), dw = W * s, dh = H * s;
+      return { ox: (SW - dw) / 2, oy: (SH - dh) / 2, dw, dh };
+    }
+    const toScreen = (p, b) => ({ x: b.ox + (1 - p.x) * b.dw, y: b.oy + p.y * b.dh });
+
+    // Where you're looking: which way the head is turned (nose against the cheeks and the
+    // eye-to-mouth line) plus where each iris sits between its eye corners and lids.
+    // Values are relative to a calibration taken while looking at the centre of the screen.
+    let base = null, calib = null, gaze = null, eyes = null;
+    function readGaze(lm) {
+      const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+      const ratio = (v, a, b) => (v - a) / ((b - a) || 1e-6);
+      const nose = lm[1], cheekA = lm[234], cheekB = lm[454];
+      const eyeMid = mid(lm[33], lm[263]), mouth = lm[13];
+      const headX = ratio(nose.x, cheekA.x, cheekB.x) - 0.5;
+      const headY = ratio(nose.y, eyeMid.y, mouth.y);
+      const irisX = (ratio(lm[468].x, lm[33].x, lm[133].x) + ratio(lm[473].x, lm[362].x, lm[263].x)) / 2;
+      const irisY = (ratio(lm[468].y, lm[159].y, lm[145].y) + ratio(lm[473].y, lm[386].y, lm[374].y)) / 2;
+      return { headX, headY, irisX, irisY, eyeA: lm[468], eyeB: lm[473] };
+    }
+    function trackEyes(now) {
+      if (!faces || video.readyState < 2) return;
+      lastTs = Math.max(now, lastTs + 1);
+      const lm = faces.detectForVideo(video, lastTs).faceLandmarks[0];
+      if (!lm) { eyes = null; return; }
+      const r = readGaze(lm), b = videoBox();
+      eyes = [toScreen(r.eyeA, b), toScreen(r.eyeB, b)];
+      if (calib) { calib.samples.push(r); return; }
+      if (!base) return;
+      const sens = +sensEl.value;
+      const gx = (r.headX - base.headX) * 1.0 + (r.irisX - base.irisX) * 1.3;
+      const gy = (r.headY - base.headY) * 0.9 + (r.irisY - base.irisY) * 0.7;
+      const target = { x: SW / 2 - gx * sens * SW * 1.7, y: SH / 2 + gy * sens * SH * 2.2 };  // mirrored
+      target.x = Math.max(0, Math.min(SW, target.x)); target.y = Math.max(0, Math.min(SH, target.y));
+      if (!gaze) gaze = { ...target };
+      gaze.x += (target.x - gaze.x) * 0.3; gaze.y += (target.y - gaze.y) * 0.3;
+    }
+    function startCalibration() {
+      calib = { start: performance.now(), samples: [] };
+      gaze = null;
+    }
+    function finishCalibration() {
+      const s = calib.samples;
+      calib = null;
+      if (!s.length) { base = { headX: 0, headY: 0.5, irisX: 0.5, irisY: 0.5 }; return; }
+      const avg = k => s.reduce((a, r) => a + r[k], 0) / s.length;
+      base = { headX: avg('headX'), headY: avg('headY'), irisX: avg('irisX'), irisY: avg('irisY') };
+    }
+
+    // ---------- sound ----------
+    let audio = null, buzz = null;
+    function startAudio() {
+      if (audio) return;
+      audio = new (window.AudioContext || window.webkitAudioContext)();
+      // one shared buzz: a wobbling sawtooth whose loudness follows how many mosquitoes are near
+      const osc = audio.createOscillator(); osc.type = 'sawtooth'; osc.frequency.value = 540;
+      const lfo = audio.createOscillator(); lfo.frequency.value = 23;
+      const lfoGain = audio.createGain(); lfoGain.gain.value = 40;
+      lfo.connect(lfoGain).connect(osc.frequency);
+      const filter = audio.createBiquadFilter(); filter.type = 'bandpass'; filter.frequency.value = 900; filter.Q.value = 1.2;
+      const gain = audio.createGain(); gain.gain.value = 0;
+      const pan = audio.createStereoPanner ? audio.createStereoPanner() : null;
+      osc.connect(filter).connect(gain);
+      if (pan) gain.connect(pan).connect(audio.destination); else gain.connect(audio.destination);
+      osc.start(); lfo.start();
+      buzz = { gain, pan, osc };
+    }
+    function pop() {
+      if (!audio) return;
+      const len = 0.25, buf = audio.createBuffer(1, audio.sampleRate * len, audio.sampleRate);
+      const d = buf.getChannelData(0);
+      for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / d.length, 3);
+      const src = audio.createBufferSource(); src.buffer = buf;
+      const f = audio.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = 1400;
+      const gn = audio.createGain(); gn.gain.value = 0.6;
+      src.connect(f).connect(gn).connect(audio.destination);
+      src.start();
+    }
+
+    // ---------- mosquitoes ----------
+    let bugs = [], smoke = [], zaps = 0, timeLeft = 0, playing = false, mouseAim = false;
+    const unit = () => Math.min(SW, SH) / 900;                 // scale for sizes and speeds
+    function spawnBug() {
+      const side = Math.floor(Math.random() * 4), m = 40;
+      const x = side === 0 ? -m : side === 1 ? SW + m : Math.random() * SW;
+      const y = side === 2 ? -m : side === 3 ? SH + m : Math.random() * SH * 0.8;
+      bugs.push({ x, y, vx: 0, vy: 0, t: Math.random() * 100, size: (22 + Math.random() * 12) * unit(),
+                  goal: { x: SW * (0.15 + Math.random() * 0.7), y: SH * (0.1 + Math.random() * 0.7) }, heading: 0 });
+    }
+    // Wander toward a drifting goal with a lot of jitter, like a mosquito that can't decide.
+    function moveBugs(dt) {
+      for (const b of bugs) {
+        b.t += dt;
+        if (Math.random() < dt * 0.6 || Math.hypot(b.goal.x - b.x, b.goal.y - b.y) < 40 * unit())
+          b.goal = { x: SW * (0.08 + Math.random() * 0.84), y: SH * (0.08 + Math.random() * 0.75) };
+        const ax = (b.goal.x - b.x) * 1.2 + (Math.random() - 0.5) * 2600 * unit();
+        const ay = (b.goal.y - b.y) * 1.2 + (Math.random() - 0.5) * 2600 * unit();
+        b.vx = (b.vx + ax * dt) * Math.pow(0.12, dt);
+        b.vy = (b.vy + ay * dt) * Math.pow(0.12, dt);
+        b.x += b.vx * dt; b.y += b.vy * dt;
+        const h = Math.atan2(b.vy, b.vx);
+        b.heading += (Math.atan2(Math.sin(h - b.heading), Math.cos(h - b.heading))) * Math.min(1, dt * 6);
+      }
+    }
+    function drawBug(b) {
+      const s = b.size;
+      g.save(); g.translate(b.x, b.y); g.rotate(b.heading);
+      // legs
+      g.strokeStyle = 'rgba(40,30,25,0.85)'; g.lineWidth = Math.max(1, s * 0.05); g.lineCap = 'round';
+      for (const k of [-1, 1]) for (let i = 0; i < 3; i++) {
+        const lx = -s * 0.1 + i * s * 0.18;
+        g.beginPath(); g.moveTo(lx, 0);
+        g.quadraticCurveTo(lx - s * 0.15, k * s * 0.45, lx - s * 0.5 + i * s * 0.1, k * s * (0.8 + i * 0.15));
+        g.stroke();
+      }
+      // wings, flapping fast
+      const flap = 0.35 + 0.65 * Math.abs(Math.sin(b.t * 70));
+      g.fillStyle = 'rgba(210,225,240,0.45)'; g.strokeStyle = 'rgba(120,140,160,0.6)'; g.lineWidth = Math.max(0.6, s * 0.03);
+      for (const k of [-1, 1]) {
+        g.beginPath(); g.ellipse(-s * 0.05, k * s * 0.32 * flap, s * 0.42, s * 0.14 * flap + 0.5, k * 0.35, 0, Math.PI * 2);
+        g.fill(); g.stroke();
+      }
+      // abdomen (striped), thorax, head, proboscis
+      g.fillStyle = '#3a2a20';
+      g.beginPath(); g.ellipse(-s * 0.42, 0, s * 0.42, s * 0.11, 0, 0, Math.PI * 2); g.fill();
+      g.strokeStyle = 'rgba(220,200,170,0.6)'; g.lineWidth = Math.max(0.6, s * 0.035);
+      for (let i = 0; i < 4; i++) { const x = -s * (0.2 + i * 0.16); g.beginPath(); g.moveTo(x, -s * 0.09); g.lineTo(x, s * 0.09); g.stroke(); }
+      g.fillStyle = '#2a1e16';
+      g.beginPath(); g.ellipse(s * 0.05, 0, s * 0.17, s * 0.14, 0, 0, Math.PI * 2); g.fill();
+      g.beginPath(); g.arc(s * 0.27, 0, s * 0.09, 0, Math.PI * 2); g.fill();
+      g.strokeStyle = '#2a1e16'; g.lineWidth = Math.max(1, s * 0.04);
+      g.beginPath(); g.moveTo(s * 0.34, 0); g.lineTo(s * 0.72, s * 0.04); g.stroke();
+      g.restore();
+    }
+    // Hit: a burst of grey smoke, an orange flash and a pop.
+    function explode(b) {
+      const n = 16;
+      for (let i = 0; i < n; i++) {
+        const a = Math.random() * Math.PI * 2, sp = (30 + Math.random() * 90) * unit();
+        smoke.push({ x: b.x, y: b.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 20 * unit(),
+                     r: (6 + Math.random() * 10) * unit(), life: 0, max: 0.9 + Math.random() * 0.7, grey: 120 + Math.random() * 80 });
+      }
+      smoke.push({ flash: true, x: b.x, y: b.y, life: 0, max: 0.25, r: b.size * 1.6 });
+      pop();
+    }
+    function drawSmoke(dt) {
+      for (const p of smoke) {
+        p.life += dt;
+        const k = p.life / p.max;
+        if (p.flash) {
+          const r = p.r * (1 + k * 2);
+          const grad = g.createRadialGradient(p.x, p.y, 0, p.x, p.y, r);
+          grad.addColorStop(0, `rgba(255,240,200,${0.9 * (1 - k)})`);
+          grad.addColorStop(0.4, `rgba(255,140,40,${0.7 * (1 - k)})`);
+          grad.addColorStop(1, 'rgba(255,80,0,0)');
+          g.fillStyle = grad; g.beginPath(); g.arc(p.x, p.y, r, 0, Math.PI * 2); g.fill();
+          continue;
+        }
+        p.x += p.vx * dt; p.y += p.vy * dt;
+        p.vx *= Math.pow(0.2, dt); p.vy = p.vy * Math.pow(0.2, dt) - 25 * unit() * dt;   // slows, drifts up
+        const r = p.r * (1 + k * 2.5);
+        g.fillStyle = `rgba(${p.grey},${p.grey},${p.grey},${0.55 * (1 - k)})`;
+        g.beginPath(); g.arc(p.x, p.y, r, 0, Math.PI * 2); g.fill();
+      }
+      smoke = smoke.filter(p => p.life < p.max);
+    }
+
+    // ---------- lasers ----------
+    let mouse = null;
+    addEventListener('pointermove', e => { mouse = { x: e.clientX, y: e.clientY }; });
+    function aim() {
+      if (mouseAim) return mouse;
+      return gaze;
+    }
+    function laserOrigins() {
+      if (!mouseAim && eyes) return eyes;
+      return [{ x: SW / 2 - 40, y: SH + 20 }, { x: SW / 2 + 40, y: SH + 20 }];   // from below with the mouse
+    }
+    function drawLasers(target, t) {
+      const from = laserOrigins();
+      const flicker = 0.8 + 0.2 * Math.sin(t * 60) * Math.sin(t * 37);
+      g.save();
+      g.globalCompositeOperation = 'lighter';
+      for (const o of from) {
+        for (const [w, col] of [[14, 'rgba(255,0,0,0.12)'], [7, 'rgba(255,20,20,0.35)'], [3, 'rgba(255,60,60,0.9)'], [1.2, 'rgba(255,220,220,1)']]) {
+          g.strokeStyle = col; g.lineWidth = w * unit() * 1.4 * flicker; g.lineCap = 'round';
+          g.beginPath(); g.moveTo(o.x, o.y); g.lineTo(target.x, target.y); g.stroke();
+        }
+        const glow = g.createRadialGradient(o.x, o.y, 0, o.x, o.y, 22 * unit());   // glowing eyes
+        glow.addColorStop(0, 'rgba(255,200,200,0.9)'); glow.addColorStop(1, 'rgba(255,0,0,0)');
+        g.fillStyle = glow; g.beginPath(); g.arc(o.x, o.y, 22 * unit(), 0, Math.PI * 2); g.fill();
+      }
+      const r = 26 * unit() * flicker;                                             // impact point
+      const hit = g.createRadialGradient(target.x, target.y, 0, target.x, target.y, r);
+      hit.addColorStop(0, 'rgba(255,255,255,1)'); hit.addColorStop(0.3, 'rgba(255,80,60,0.9)'); hit.addColorStop(1, 'rgba(255,0,0,0)');
+      g.fillStyle = hit; g.beginPath(); g.arc(target.x, target.y, r, 0, Math.PI * 2); g.fill();
+      g.restore();
+    }
+
+    // ---------- game loop ----------
+    let last = performance.now(), spawnTimer = 0;
+    function frame(now) {
+      requestAnimationFrame(frame);
+      const dt = Math.min(0.05, (now - last) / 1000); last = now;
+      try { trackEyes(now); } catch (err) { console.warn('eye tracking failed', err); }
+
+      g.clearRect(0, 0, SW, SH);
+      if (video.readyState >= 2) {
+        const b = videoBox();
+        g.save(); g.translate(b.ox + b.dw, b.oy); g.scale(-1, 1); g.drawImage(video, 0, 0, b.dw, b.dh); g.restore();
+      } else {
+        const bg = g.createLinearGradient(0, 0, 0, SH); bg.addColorStop(0, '#1d2733'); bg.addColorStop(1, '#0b0f14');
+        g.fillStyle = bg; g.fillRect(0, 0, SW, SH);
+      }
+
+      if (calib) {                                            // look at the dot
+        const k = Math.min(1, (now - calib.start) / 1500);
+        g.fillStyle = 'rgba(0,0,0,0.35)'; g.fillRect(0, 0, SW, SH);
+        g.fillStyle = '#ff3b30'; g.beginPath(); g.arc(SW / 2, SH / 2, 10 + 6 * Math.sin(now / 120), 0, Math.PI * 2); g.fill();
+        g.strokeStyle = '#fff'; g.lineWidth = 4;
+        g.beginPath(); g.arc(SW / 2, SH / 2, 30, -Math.PI / 2, -Math.PI / 2 + k * Math.PI * 2); g.stroke();
+        g.fillStyle = '#fff'; g.font = '600 18px system-ui'; g.textAlign = 'center';
+        g.fillText('Look at the red dot', SW / 2, SH / 2 + 64);
+        if (k >= 1) finishCalibration();
+        return;
+      }
+
+      if (playing) {
+        timeLeft -= dt;
+        spawnTimer -= dt;
+        const want = Math.min(12, 4 + Math.floor((ROUND - timeLeft) / 8));   // more as the round goes on
+        if (bugs.length < want && spawnTimer <= 0) { spawnBug(); spawnTimer = 0.4; }
+        if (timeLeft <= 0) endRound();
+      }
+      moveBugs(dt);
+
+      const target = playing ? aim() : null;
+      if (target) {
+        const hitR = 32 * unit();
+        for (const b of bugs) if (Math.hypot(b.x - target.x, b.y - target.y) < hitR + b.size * 0.5) { b.dead = true; explode(b); zaps++; }
+        bugs = bugs.filter(b => !b.dead);
+      }
+      for (const b of bugs) drawBug(b);
+      drawSmoke(dt);
+      if (target) drawLasers(target, now / 1000);
+
+      if (buzz) {                                             // louder with more (and closer) bugs
+        const near = bugs.reduce((a, b) => a + b.size / (18 * unit()), 0);
+        buzz.gain.gain.setTargetAtTime(playing ? Math.min(0.05, 0.008 * near) : 0, audio.currentTime, 0.1);
+        if (buzz.pan && bugs.length) buzz.pan.pan.setTargetAtTime(Math.max(-1, Math.min(1, (bugs.reduce((a, b) => a + b.x, 0) / bugs.length / SW) * 2 - 1)), audio.currentTime, 0.2);
+        buzz.osc.frequency.setTargetAtTime(520 + 40 * Math.sin(now / 700), audio.currentTime, 0.2);
+      }
+      scoreEl.textContent = `${zaps} zapped`;
+      timeEl.textContent = playing ? `${Math.max(0, Math.ceil(timeLeft))}s` : '';
+      if (playing && !mouseAim && !eyes) status.textContent = 'Can’t see your eyes — face the camera';
+      else if (status.textContent.startsWith('Can’t see')) status.textContent = '';
+    }
+
+    function startRound() {
+      bugs = []; smoke = []; zaps = 0; timeLeft = ROUND; spawnTimer = 0; playing = true;
+      for (let i = 0; i < 4; i++) spawnBug();
+      panel.hidden = true;
+    }
+    function endRound() {
+      playing = false;
+      panelText.textContent = `Time! You zapped ${zaps} mosquito${zaps === 1 ? '' : 'es'}.`;
+      document.getElementById('play').textContent = 'Play again';
+      panel.hidden = false;
+    }
+
+    document.getElementById('play').addEventListener('click', async () => {
+      startAudio();
+      mouseAim = false;
+      panelText.textContent = 'Starting camera…';
+      try {
+        if (!stream) await startCamera();
+        if (!faces) await loadFaces();
+      } catch (err) {
+        panelText.textContent = err.name === 'NotAllowedError'
+          ? 'Camera access was blocked. Allow it in your browser’s site settings, or play with the mouse.'
+          : `Couldn’t start eye tracking: ${err.message}. You can play with the mouse.`;
+        return;
+      }
+      startCalibration();
+      panel.hidden = true;
+      const wait = () => calib ? requestAnimationFrame(wait) : startRound();
+      wait();
+    });
+    document.getElementById('playMouse').addEventListener('click', () => {
+      startAudio();
+      mouseAim = true;
+      startRound();
+    });
+    document.getElementById('recal').addEventListener('click', () => { if (faces && !mouseAim) startCalibration(); });
+
+    requestAnimationFrame(frame);
+  </script>
+</body>
+</html>
