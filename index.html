@@ -41,22 +41,20 @@
   </div>
 
   <script type="module">
-    import { FaceDetector, FilesetResolver } from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs';
+    import { FaceDetector, ImageSegmenter, FilesetResolver } from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs';
 
     const video = document.getElementById('video');
     const out = document.getElementById('out');
-    const g = out.getContext('2d');
     const msg = document.getElementById('msg');
     const status = document.getElementById('status');
     const picker = document.getElementById('cameras');
-    const col = document.createElement('canvas');     // the head + neck, feathered at the edges
-    const cg = col.getContext('2d');
-    let stream = null, detector = null, heads = true;
+    let stream = null, detector = null, segmenter = null, heads = true;
     let face = null;                                   // smoothed face box in video pixels
-    let lastTs = 0;                                    // the detector needs increasing timestamps
+    let lastTs = 0;                                    // the models need increasing timestamps
 
     function show(text) { msg.textContent = text; msg.hidden = !text; }
 
+    // ---------- camera ----------
     async function start(deviceId) {
       if (stream) stream.getTracks().forEach(t => t.stop());
       try {
@@ -83,29 +81,40 @@
       picker.hidden = devices.length < 2;
     }
 
-    async function loadDetector() {
+    // ---------- tracking: face box + person silhouette ----------
+    async function loadModels() {
       status.textContent = 'Loading face tracking…';
       try {
         const vision = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
-        detector = await FaceDetector.createFromOptions(vision, {
-          baseOptions: {
-            modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite',
-            delegate: 'GPU',
-          },
-          runningMode: 'VIDEO',
-        });
-        status.textContent = '';
+        [detector, segmenter] = await Promise.all([
+          FaceDetector.createFromOptions(vision, {
+            baseOptions: {
+              modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite',
+              delegate: 'GPU',
+            },
+            runningMode: 'VIDEO',
+          }),
+          ImageSegmenter.createFromOptions(vision, {
+            baseOptions: {
+              modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/1/selfie_segmenter.tflite',
+              delegate: 'GPU',
+            },
+            runningMode: 'VIDEO',
+            outputConfidenceMasks: true,
+            outputCategoryMask: false,
+          }).catch(() => null),
+        ]);
+        status.textContent = segmenter ? '' : 'Outline tracking unavailable — using a soft oval';
       } catch (err) {
         status.textContent = 'Face tracking unavailable — using a fixed position';
       }
     }
 
-    function trackFace(now) {
+    function trackFace(ts) {
       const W = video.videoWidth, H = video.videoHeight;
       let box = null;
       if (detector) {
-        lastTs = Math.max(now, lastTs + 1);
-        const d = detector.detectForVideo(video, lastTs).detections[0];
+        const d = detector.detectForVideo(video, ts).detections[0];
         if (d) box = d.boundingBox;
       }
       if (!box && !face) box = { originX: W * 0.4, originY: H * 0.2, width: W * 0.2, height: W * 0.2 };
@@ -116,70 +125,159 @@
       face.w += (box.width - face.w) * k;   face.h += (box.height - face.h) * k;
     }
 
-    // Everything below the neck is drawn as-is. The head and neck are cut out with a soft
-    // mask and drawn three times: the copies share the base of the neck and branch apart
-    // up the length of the neck, so one neck splits into three heads.
-    const mask = document.createElement('canvas');
-    const mg = mask.getContext('2d');
-    function drawHeads() {
-      const H = out.height;
-      const cx = face.x + face.w / 2;
-      const chinY = face.y + face.h;
-      const neckY = Math.min(H, chinY + face.h * 0.5);       // where the split starts
-      const top = Math.max(0, face.y - face.h * 0.6);        // top of the head, hair included
-      const colW = Math.round(face.w * 2.2), colX = Math.round(cx - colW / 2);
-      const colY = Math.round(top), colH = Math.round(neckY + face.h * 0.25 - top);
-      if (colW < 8 || colH < 8) return;
+    // The silhouette is computed on a small copy of the frame; the GPU smooths it back up.
+    const small = document.createElement('canvas');
+    const sg = small.getContext('2d', { willReadFrequently: true });
+    let maskBytes = null, maskW = 0, maskH = 0;
+    function trackPerson(ts) {
+      if (!segmenter) return false;
+      const w = 256, h = Math.round(256 * video.videoHeight / video.videoWidth);
+      if (small.width !== w || small.height !== h) { small.width = w; small.height = h; }
+      sg.drawImage(video, 0, 0, w, h);
+      const result = segmenter.segmentForVideo(small, ts);
+      const mask = result.confidenceMasks && result.confidenceMasks[0];
+      if (mask) {
+        const f = mask.getAsFloat32Array();
+        if (!maskBytes || maskBytes.length !== f.length) maskBytes = new Uint8Array(f.length);
+        for (let i = 0; i < f.length; i++) maskBytes[i] = f[i] * 255;
+        maskW = mask.width; maskH = mask.height;
+      }
+      result.close();
+      return !!mask;
+    }
 
-      // soft head + neck silhouette, relative to the column
-      mask.width = colW; mask.height = colH;
-      const blur = Math.max(2, face.w * 0.06);
-      mg.filter = `blur(${blur}px)`;
-      mg.fillStyle = '#000';
-      mg.beginPath();
-      mg.ellipse(colW / 2, face.y + face.h * 0.38 - top, face.w * 0.62, face.h * 0.95, 0, 0, Math.PI * 2);
-      mg.fill();
-      const neckW = face.w * 0.52;
-      mg.fillRect(colW / 2 - neckW / 2, chinY - face.h * 0.3 - top, neckW, neckY - chinY + face.h * 0.3);
-      mg.filter = 'none';
-      mg.globalCompositeOperation = 'destination-in';        // fade out below the split point
-      const vy = mg.createLinearGradient(0, 0, 0, colH);
-      vy.addColorStop(0, '#000'); vy.addColorStop(Math.min(1, (neckY - top) / colH), '#000');
-      vy.addColorStop(1, 'rgba(0,0,0,0)');
-      mg.fillStyle = vy; mg.fillRect(0, 0, colW, colH);
-      mg.globalCompositeOperation = 'source-over';
+    // ---------- GPU compositing ----------
+    // Per pixel: the shirt below the neck is stretched outward around a wider neck base,
+    // then three copies of the head and neck (cut out by the person silhouette) are laid
+    // over it. The copies coincide at the base of the neck and branch apart up the neck,
+    // fading in so they grow seamlessly out of the real neck. The real head goes on top.
+    const gl = out.getContext('webgl', { preserveDrawingBuffer: true, premultipliedAlpha: false });
+    const VERT = `
+      attribute vec2 aPos; varying vec2 vUv;
+      void main() { vUv = vec2(aPos.x * 0.5 + 0.5, 0.5 - aPos.y * 0.5); gl_Position = vec4(aPos, 0.0, 1.0); }`;
+    const FRAG = `
+      precision highp float;
+      varying vec2 vUv;
+      uniform sampler2D uVideo, uMask;
+      uniform vec2 uRes, uHead;
+      uniform float uCx, uChin, uNeck, uFw, uFh, uSpread, uDroop, uBulge, uOn, uHasMask;
 
-      col.width = colW; col.height = colH;
-      cg.drawImage(video, colX, colY, colW, colH, 0, 0, colW, colH);
-      cg.globalCompositeOperation = 'destination-in';
-      cg.drawImage(mask, 0, 0);
-      cg.globalCompositeOperation = 'source-over';
+      float ease(float t) { t = clamp(t, 0.0, 1.0); return t * t * (3.0 - 2.0 * t); }
 
-      const spread = face.w * 1.1, droop = face.h * 0.15;
-      const rise = neckY - (chinY - face.h * 0.1);           // branch over the length of the neck
-      const strip = 2;
-      const copy = k => {
-        for (let y = 0; y < colH; y += strip) {
-          const t = Math.max(0, Math.min(1, (neckY - (colY + y)) / rise));
-          const e = t * t * (3 - 2 * t);
-          g.drawImage(col, 0, y, colW, strip, colX + k * spread * e, colY + y + Math.abs(k) * droop * e, colW, strip);
+      // how much of pixel p is the person
+      float person(vec2 p) {
+        if (uHasMask > 0.5) return smoothstep(0.25, 0.75, texture2D(uMask, p / uRes).r);
+        vec2 d = (p - uHead) / vec2(uFw * 0.62, uFh * 0.95);             // fallback: soft oval + neck
+        float head = 1.0 - smoothstep(0.8, 1.05, length(d));
+        float neck = (1.0 - smoothstep(uFw * 0.2, uFw * 0.3, abs(p.x - uCx))) * smoothstep(uChin - uFh * 0.4, uChin - uFh * 0.2, p.y);
+        return max(head, neck);
+      }
+      // how much of pixel p belongs to the head + neck that gets copied
+      float headPart(vec2 p) {
+        float above = 1.0 - smoothstep(uNeck - uFh * 0.45, uNeck + uFh * 0.15, p.y);  // fades out down the neck
+        float k = smoothstep(uChin + uFh * 0.15, uChin - uFh * 0.35, p.y);           // 1 at the head, 0 at the neck
+        float halfW = mix(uFw * 0.42, uFw * 0.85, k);                               // column narrows to the neck
+        float column = 1.0 - smoothstep(halfW * 0.7, halfW, abs(p.x - uCx));
+        return above * column * person(p);
+      }
+
+      void main() {
+        vec2 p = vUv * uRes;
+        vec2 q = p;
+        if (uOn > 0.5) {                                    // stretch the collar around the wider neck
+          float band = smoothstep(uNeck - uFh * 0.6, uNeck, p.y) * (1.0 - smoothstep(uNeck, uNeck + uFh * 1.5, p.y));
+          float g = exp(-pow((p.x - uCx) / (uFw * 1.4), 2.0));
+          q.x = uCx + (p.x - uCx) / (1.0 + uBulge * band * g);
         }
+        vec3 col = texture2D(uVideo, q / uRes).rgb;
+        if (uOn > 0.5) {
+          float base = uNeck + uFh * 0.2;                   // necks branch from here up to the chin
+          float t = ease((base - p.y) / (base - (uChin - uFh * 0.1)));
+          for (int i = 0; i < 3; i++) {
+            float k = i == 0 ? -1.0 : (i == 1 ? 1.0 : 0.0);  // left, right, then the real head on top
+            vec2 src = p - vec2(k * uSpread * t, abs(k) * uDroop * t);
+            float a = headPart(src);
+            if (k != 0.0) a *= smoothstep(0.0, 0.35, t);    // side necks grow out of the real one
+            col = mix(col, texture2D(uVideo, src / uRes).rgb, a);
+          }
+        }
+        gl_FragColor = vec4(col, 1.0);
+      }`;
+
+    function compile(type, src) {
+      const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+      return s;
+    }
+    const U = {};
+    let videoTex, maskTex;
+    function setupGL() {
+      const prog = gl.createProgram();
+      gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
+      gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG));
+      gl.linkProgram(prog);
+      gl.useProgram(prog);
+      gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+      const aPos = gl.getAttribLocation(prog, 'aPos');
+      gl.enableVertexAttribArray(aPos);
+      gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+      for (const n of ['uVideo', 'uMask', 'uRes', 'uHead', 'uCx', 'uChin', 'uNeck', 'uFw', 'uFh', 'uSpread', 'uDroop', 'uBulge', 'uOn', 'uHasMask'])
+        U[n] = gl.getUniformLocation(prog, n);
+      const makeTexture = unit => {
+        const t = gl.createTexture();
+        gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, t);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        return t;
       };
-      copy(-1); copy(1); copy(0);
+      videoTex = makeTexture(0); maskTex = makeTexture(1);
+      gl.uniform1i(U.uVideo, 0); gl.uniform1i(U.uMask, 1);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
     }
 
     function frame(now) {
       requestAnimationFrame(frame);
       if (!(video.readyState >= 2 && video.videoWidth)) return;
-      if (out.width !== video.videoWidth || out.height !== video.videoHeight) {
-        out.width = video.videoWidth; out.height = video.videoHeight;
+      const W = video.videoWidth, H = video.videoHeight;
+      if (out.width !== W || out.height !== H) { out.width = W; out.height = H; gl.viewport(0, 0, W, H); }
+
+      let hasMask = false;
+      if (heads) {
+        lastTs = Math.max(now, lastTs + 1);
+        try { trackFace(lastTs); } catch (err) { console.warn('face tracking failed', err); }
+        try { hasMask = trackPerson(lastTs); } catch (err) { console.warn('outline tracking failed', err); }
       }
-      g.drawImage(video, 0, 0);
-      if (!heads) return;
-      try { trackFace(now); } catch (err) { console.warn('face tracking failed', err); }
-      if (face) drawHeads();
+
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, videoTex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+      if (hasMask) {
+        gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, maskTex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, maskW, maskH, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE, maskBytes);
+      }
+
+      const on = heads && face;
+      gl.uniform2f(U.uRes, W, H);
+      gl.uniform1f(U.uOn, on ? 1 : 0);
+      gl.uniform1f(U.uHasMask, hasMask ? 1 : 0);
+      if (on) {
+        const cx = face.x + face.w / 2, chin = face.y + face.h;
+        gl.uniform2f(U.uHead, cx, face.y + face.h * 0.38);
+        gl.uniform1f(U.uCx, cx);
+        gl.uniform1f(U.uChin, chin);
+        gl.uniform1f(U.uNeck, Math.min(H, chin + face.h * 0.55));
+        gl.uniform1f(U.uFw, face.w);
+        gl.uniform1f(U.uFh, face.h);
+        gl.uniform1f(U.uSpread, face.w * 1.15);
+        gl.uniform1f(U.uDroop, face.h * 0.15);
+        gl.uniform1f(U.uBulge, 0.55);
+      }
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     }
 
+    // ---------- controls ----------
     picker.addEventListener('change', () => start(picker.value));
     document.getElementById('heads').addEventListener('click', e => {
       heads = !heads;
@@ -204,8 +302,11 @@
 
     if (!navigator.mediaDevices?.getUserMedia) {
       show('This browser can’t access the camera here. Open the page from http://localhost.');
+    } else if (!gl) {
+      show('This browser doesn’t support WebGL, which the effect needs.');
     } else {
-      loadDetector();
+      setupGL();
+      loadModels();
       start();
       requestAnimationFrame(frame);
     }
