@@ -167,6 +167,7 @@
       uniform sampler2D uVideo, uMask, uVidL, uMaskL, uVidR, uMaskR;
       uniform vec2 uRes, uMaskTexel;
       uniform float uCx, uFaceTop, uChin, uNeck, uFw, uFh, uOn;
+      uniform float uLift;             // how much taller the neck is: every head rises by this much
       // The side heads are their own creatures: each is cut from an older frame (its face
       // box there is uFace*: centre x, top, chin, width) and placed where its own neck
       // ends now (uHead*: x, y, tilt, scale), optionally mirrored.
@@ -189,7 +190,7 @@
       }
       // the head down to just under the jaw; f = (centre x, top, chin, width)
       float headPart(sampler2D m, vec2 p, vec4 f) {
-        float above = 1.0 - smoothstep(f.z - uFh * 0.05, f.z + uFh * 0.12, p.y);
+        float above = 1.0 - smoothstep(f.z - uFh * 0.14, f.z + uFh * 0.1, p.y);
         float column = 1.0 - smoothstep(f.w * 1.0, f.w * 1.3, abs(p.x - f.x));   // wide enough for cap brims
         return above * column * person(m, p, f.y);
       }
@@ -219,13 +220,14 @@
         float g = exp(-pow((p.x - uCx) / (uFw * 1.3), 2.0));
         vec2 q = vec2(uCx + (p.x - uCx) / (1.0 + (rb / rn - 1.0) * band * g), p.y);
         vec3 col = texture2D(uVideo, q / uRes).rgb;
-        float fig = person(uMask, q, uFaceTop);
+        // only the body below the jaw stays where it is; the head is redrawn higher up
+        float fig = person(uMask, q, uFaceTop) * smoothstep(uChin - uFh * 0.05, uChin + uFh * 0.3, q.y);
 
         // one neck forking into three, each branch reaching up to its head
         float dU = 0.0, dMin = 1e5, wsum = 0.0;
         vec3 skin = vec3(0.0);
         for (int i = 0; i < 3; i++) {
-          vec2 top = i == 0 ? uHeadL.xy : (i == 1 ? vec2(uCx, uChin - uFh * 0.02) : uHeadR.xy);
+          vec2 top = i == 0 ? uHeadL.xy : (i == 1 ? vec2(uCx, uChin - uFh * 0.02 - uLift) : uHeadR.xy);
           float rTop = rt * (i == 0 ? uHeadL.w : (i == 1 ? 1.0 : uHeadR.w));
           vec2 ab = top - base;
           float s = clamp(dot(p - base, ab) / dot(ab, ab), 0.0, 1.0);
@@ -239,12 +241,14 @@
           // skin from the real neck: across the branch -> across the neck, along -> up it
           vec2 src = vec2(uCx + clamp(u / r, -1.0, 1.0) * rn, mix(realBot, realTop, s));
           float w = exp(-max(d, 0.0) / (uFw * 0.06)) + 1e-4;
-          float shade = 1.0 - 0.18 * pow(clamp(abs(u) / r, 0.0, 1.0), 2.0);  // rounded shading
+          float shade = 1.0 - 0.3 * pow(clamp(abs(u) / r, 0.0, 1.0), 2.0);   // rounded shading
+          shade *= 1.0 - 0.3 * smoothstep(0.7, 1.0, s);                        // shadow under the jaw
           skin += texture2D(uVideo, src / uRes).rgb * shade * w;
           wsum += w;
         }
         skin /= wsum;
-        skin *= 1.0 - 0.22 * clamp((dMin - dU) / (uFw * 0.12), 0.0, 1.0);   // shadow in the forks
+        skin *= 0.8;                                                           // necks a touch darker
+        skin *= 1.0 - 0.3 * clamp((dMin - dU) / (uFw * 0.12), 0.0, 1.0);    // shadow in the forks
         float neckA = 1.0 - smoothstep(-uFw * 0.04, uFw * 0.04, dU);
         neckA *= smoothstep(base.y + uFh * 0.05, base.y - uFh * 0.3, p.y);   // melt into the collar
         col = mix(col, skin, neckA);
@@ -255,8 +259,9 @@
         col = mix(col, hl.rgb, hl.a); fig = max(fig, hl.a);
         vec4 hr = sideHead(uVidR, uMaskR, p, uHeadR, uMirR, uFaceR);
         col = mix(col, hr.rgb, hr.a); fig = max(fig, hr.a);
-        float a = headPart(uMask, p, fNow);
-        col = mix(col, texture2D(uVideo, vUv).rgb, a); fig = max(fig, a);
+        vec2 hp = p + vec2(0.0, uLift);
+        float a = headPart(uMask, hp, fNow);
+        col = mix(col, texture2D(uVideo, hp / uRes).rgb, a); fig = max(fig, a);
         gl_FragColor = vec4(col, fig);
       }`;
 
@@ -370,12 +375,13 @@
       { k: 1,  delay: 14, mirror: -1, scale: 1.03, freq: 0.7, phase: 2.1, pos: null, vel: [0, 0], tilt: 0 },
     ];
     let lastNow = 0;
+    const LIFT = 0.5;                  // neck lengthening, in face heights
 
     let P, figT, glowT = [], glowI = 0;
     function setupGL() {
       P = {
         figure: program(FIGURE, ['uVideo', 'uMask', 'uVidL', 'uMaskL', 'uVidR', 'uMaskR', 'uRes', 'uMaskTexel',
-          'uCx', 'uFaceTop', 'uChin', 'uNeck', 'uFw', 'uFh', 'uOn', 'uHeadL', 'uHeadR', 'uFaceL', 'uFaceR', 'uMirL', 'uMirR']),
+          'uCx', 'uFaceTop', 'uChin', 'uNeck', 'uFw', 'uFh', 'uOn', 'uLift', 'uHeadL', 'uHeadR', 'uFaceL', 'uFaceR', 'uMirL', 'uMirR']),
         glow: program(GLOW, ['uFig', 'uPrev', 'uRes', 'uTime']),
         aura: program(AURA, ['uFig', 'uGlow', 'uVideo', 'uRes', 'uTime', 'uOn']),
       };
@@ -408,7 +414,7 @@
       const cx = face.x + face.w / 2, chin = face.y + face.h;
       for (const o of others) {
         const target = [cx + o.k * face.w * 1.15 + Math.sin(t * o.freq + o.phase) * face.w * 0.08,
-                        chin - face.h * 0.02 + face.h * 0.15 + Math.sin(t * o.freq * 1.3 + o.phase) * face.h * 0.05];
+                        chin - face.h * 0.02 + face.h * 0.15 - face.h * LIFT + Math.sin(t * o.freq * 1.3 + o.phase) * face.h * 0.05];
         if (!o.pos) o.pos = target.slice();
         const K = 22, C = 2 * 0.45 * Math.sqrt(K);
         for (let i = 0; i < 2; i++) {
@@ -461,6 +467,7 @@
         gl.uniform1f(P.figure.uNeck, Math.min(H, chin + face.h * 0.55));
         gl.uniform1f(P.figure.uFw, face.w);
         gl.uniform1f(P.figure.uFh, face.h);
+        gl.uniform1f(P.figure.uLift, face.h * LIFT);
         const setOther = (o, s, headU, faceU, mirU) => {
           const f = s.face || face;
           gl.uniform4f(P.figure[headU], o.pos[0], o.pos[1], o.tilt, o.scale);
