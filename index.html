@@ -35,7 +35,7 @@
   <div id="status" class="status"></div>
   <div class="bar">
     <select id="cameras" aria-label="Camera" hidden></select>
-    <button id="heads" type="button">Three heads: on</button>
+    <button id="effect" type="button">Effect: on</button>
     <button id="mirror" type="button">Mirror: on</button>
     <button id="snap" type="button">Snapshot</button>
   </div>
@@ -48,7 +48,7 @@
     const msg = document.getElementById('msg');
     const status = document.getElementById('status');
     const picker = document.getElementById('cameras');
-    let stream = null, detector = null, segmenter = null, heads = true;
+    let stream = null, detector = null, segmenter = null, effect = true;
     let face = null;                                   // smoothed face box in video pixels
     let lastTs = 0;                                    // the models need increasing timestamps
 
@@ -104,9 +104,9 @@
             outputCategoryMask: false,
           }).catch(() => null),
         ]);
-        status.textContent = segmenter ? '' : 'Outline tracking unavailable — using a soft oval';
+        status.textContent = segmenter ? '' : 'Body outline unavailable — the effect needs it';
       } catch (err) {
-        status.textContent = 'Face tracking unavailable — using a fixed position';
+        status.textContent = 'Tracking unavailable — check your connection and reload';
       }
     }
 
@@ -146,61 +146,170 @@
       return !!mask;
     }
 
-    // ---------- GPU compositing ----------
-    // Per pixel: the shirt below the neck is stretched outward around a wider neck base,
-    // then three copies of the head and neck (cut out by the person silhouette) are laid
-    // over it. The copies coincide at the base of the neck and branch apart up the neck,
-    // fading in so they grow seamlessly out of the real neck. The real head goes on top.
+    // ---------- GPU passes ----------
+    // 1. FIGURE: build the three-headed figure from the frame. One neck forks into three
+    //    (a smooth union of three tapered branches, skinned with the real neck stretched
+    //    over each), the collar stretches around the wider base, and the heads sit on top.
+    //    Colour goes in rgb, how much of each pixel is the figure goes in alpha.
+    // 2. GLOW: halo around the figure plus flickering horizontal streaks, keeping part of
+    //    last frame's glow so it trails and drifts up as you move.
+    // 3. AURA: grainy burnt-orange field, white-hot glow fading to yellow and orange, and
+    //    the figure itself as an inverted teal-black silhouette.
+    // Render targets store rows bottom-up, so passes read them back at (u, 1 - v).
     const gl = out.getContext('webgl', { preserveDrawingBuffer: true, premultipliedAlpha: false });
     const VERT = `
       attribute vec2 aPos; varying vec2 vUv;
       void main() { vUv = vec2(aPos.x * 0.5 + 0.5, 0.5 - aPos.y * 0.5); gl_Position = vec4(aPos, 0.0, 1.0); }`;
-    const FRAG = `
+
+    const FIGURE = `
       precision highp float;
       varying vec2 vUv;
       uniform sampler2D uVideo, uMask;
-      uniform vec2 uRes, uHead;
-      uniform float uCx, uChin, uNeck, uFw, uFh, uSpread, uDroop, uBulge, uOn, uHasMask;
+      uniform vec2 uRes, uMaskTexel;
+      uniform float uCx, uFaceTop, uChin, uNeck, uFw, uFh, uSpread, uDroop, uOn;
 
-      float ease(float t) { t = clamp(t, 0.0, 1.0); return t * t * (3.0 - 2.0 * t); }
-
-      // how much of pixel p is the person
+      float seg(vec2 p) { return texture2D(uMask, p / uRes).r; }
+      // Person coverage. Caps and hair come back with weaker confidence, so on the top of
+      // the head the threshold drops and the mask reaches one texel further.
       float person(vec2 p) {
-        if (uHasMask > 0.5) return smoothstep(0.25, 0.75, texture2D(uMask, p / uRes).r);
-        vec2 d = (p - uHead) / vec2(uFw * 0.62, uFh * 0.95);             // fallback: soft oval + neck
-        float head = 1.0 - smoothstep(0.8, 1.05, length(d));
-        float neck = (1.0 - smoothstep(uFw * 0.2, uFw * 0.3, abs(p.x - uCx))) * smoothstep(uChin - uFh * 0.4, uChin - uFh * 0.2, p.y);
-        return max(head, neck);
+        float m = seg(p);
+        float cap = smoothstep(uFaceTop + uFh * 0.25, uFaceTop - uFh * 0.05, p.y);
+        if (cap > 0.0) {
+          vec2 o = uMaskTexel * uRes * 1.2;
+          float n = max(max(seg(p + vec2(o.x, 0.0)), seg(p - vec2(o.x, 0.0))),
+                        max(seg(p - vec2(0.0, o.y)), seg(p + vec2(0.0, o.y))));
+          m = max(m, n * cap);
+        }
+        return smoothstep(mix(0.3, 0.06, cap), mix(0.7, 0.38, cap), m);
       }
-      // how much of pixel p belongs to the head + neck that gets copied
+      // the head down to just under the jaw, cut out of the real frame
       float headPart(vec2 p) {
-        float above = 1.0 - smoothstep(uNeck - uFh * 0.45, uNeck + uFh * 0.15, p.y);  // fades out down the neck
-        float k = smoothstep(uChin + uFh * 0.15, uChin - uFh * 0.35, p.y);           // 1 at the head, 0 at the neck
-        float halfW = mix(uFw * 0.42, uFw * 0.85, k);                               // column narrows to the neck
-        float column = 1.0 - smoothstep(halfW * 0.7, halfW, abs(p.x - uCx));
+        float above = 1.0 - smoothstep(uChin - uFh * 0.05, uChin + uFh * 0.12, p.y);
+        float column = 1.0 - smoothstep(uFw * 1.0, uFw * 1.3, abs(p.x - uCx));   // wide enough for cap brims
         return above * column * person(p);
+      }
+      float smin(float a, float b, float k) {
+        float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+        return mix(b, a, h) - k * h * (1.0 - h);
       }
 
       void main() {
         vec2 p = vUv * uRes;
-        vec2 q = p;
-        if (uOn > 0.5) {                                    // stretch the collar around the wider neck
-          float band = smoothstep(uNeck - uFh * 0.6, uNeck, p.y) * (1.0 - smoothstep(uNeck, uNeck + uFh * 1.5, p.y));
-          float g = exp(-pow((p.x - uCx) / (uFw * 1.4), 2.0));
-          q.x = uCx + (p.x - uCx) / (1.0 + uBulge * band * g);
-        }
+        if (uOn < 0.5) { gl_FragColor = vec4(texture2D(uVideo, vUv).rgb, person(p)); return; }
+        float rb = uFw * 0.5, rt = uFw * 0.29, rn = uFw * 0.27;     // base, top and real neck half-widths
+        vec2 base = vec2(uCx, uNeck + uFh * 0.1);
+        float topY = uChin - uFh * 0.02, realTop = uChin + uFh * 0.06, realBot = uNeck;
+
+        // shirt and collar stretch around the wider neck base
+        float band = smoothstep(uNeck - uFh * 0.5, uNeck, p.y) * (1.0 - smoothstep(uNeck, uNeck + uFh * 1.6, p.y));
+        float g = exp(-pow((p.x - uCx) / (uFw * 1.3), 2.0));
+        vec2 q = vec2(uCx + (p.x - uCx) / (1.0 + (rb / rn - 1.0) * band * g), p.y);
         vec3 col = texture2D(uVideo, q / uRes).rgb;
-        if (uOn > 0.5) {
-          float base = uNeck + uFh * 0.2;                   // necks branch from here up to the chin
-          float t = ease((base - p.y) / (base - (uChin - uFh * 0.1)));
-          for (int i = 0; i < 3; i++) {
-            float k = i == 0 ? -1.0 : (i == 1 ? 1.0 : 0.0);  // left, right, then the real head on top
-            vec2 src = p - vec2(k * uSpread * t, abs(k) * uDroop * t);
-            float a = headPart(src);
-            if (k != 0.0) a *= smoothstep(0.0, 0.35, t);    // side necks grow out of the real one
-            col = mix(col, texture2D(uVideo, src / uRes).rgb, a);
-          }
+        float fig = person(q);
+
+        // one neck forking into three
+        float dU = 0.0, dMin = 1e5, wsum = 0.0;
+        vec3 skin = vec3(0.0);
+        for (int i = 0; i < 3; i++) {
+          float k = float(i) - 1.0;
+          vec2 top = vec2(uCx + k * uSpread, topY + abs(k) * uDroop);
+          vec2 ab = top - base;
+          float s = clamp(dot(p - base, ab) / dot(ab, ab), 0.0, 1.0);
+          vec2 c = base + ab * s;
+          vec2 n = normalize(vec2(-ab.y, ab.x));
+          float r = mix(rb, rt, s);
+          float u = dot(p - c, n);
+          float d = length(p - c) - r;
+          dU = i == 0 ? d : smin(dU, d, uFw * 0.35);
+          dMin = min(dMin, d);
+          // skin from the real neck: across the branch -> across the neck, along -> up it
+          vec2 src = vec2(uCx + clamp(u / r, -1.0, 1.0) * rn, mix(realBot, realTop, s));
+          float w = exp(-max(d, 0.0) / (uFw * 0.06)) + 1e-4;
+          float shade = 1.0 - 0.18 * pow(clamp(abs(u) / r, 0.0, 1.0), 2.0);  // rounded shading
+          skin += texture2D(uVideo, src / uRes).rgb * shade * w;
+          wsum += w;
         }
+        skin /= wsum;
+        skin *= 1.0 - 0.22 * clamp((dMin - dU) / (uFw * 0.12), 0.0, 1.0);   // shadow in the forks
+        float neckA = 1.0 - smoothstep(-uFw * 0.04, uFw * 0.04, dU);
+        neckA *= smoothstep(base.y + uFh * 0.05, base.y - uFh * 0.3, p.y);   // melt into the collar
+        col = mix(col, skin, neckA);
+        fig = max(fig, neckA);
+
+        // the two copied heads, then the real head on top
+        for (int i = 0; i < 3; i++) {
+          float k = i == 0 ? -1.0 : (i == 1 ? 1.0 : 0.0);
+          vec2 src = p - vec2(k * uSpread, abs(k) * uDroop);
+          float a = headPart(src);
+          col = mix(col, texture2D(uVideo, src / uRes).rgb, a);
+          fig = max(fig, a);
+        }
+        gl_FragColor = vec4(col, fig);
+      }`;
+
+    const GLOW = `
+      precision highp float;
+      varying vec2 vUv;
+      uniform sampler2D uFig, uPrev;
+      uniform vec2 uRes;
+      uniform float uTime;
+      float hash(float n) { return fract(sin(n) * 43758.5453); }
+      float noise(float x) { float i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f); return mix(hash(i), hash(i + 1.0), f); }
+      float fig(vec2 uv) { return texture2D(uFig, vec2(uv.x, 1.0 - uv.y)).a; }
+      void main() {
+        vec2 uv = vUv;
+        float aspect = uRes.x / uRes.y;
+        // soft halo: how much figure sits within growing rings around this pixel
+        float halo = 0.0;
+        for (int r = 1; r <= 3; r++) {
+          float rad = float(r) * 0.028;
+          float sum = 0.0;
+          for (int i = 0; i < 10; i++) {
+            float a = float(i) * 0.6283 + float(r) * 1.3;
+            sum += fig(uv + vec2(cos(a) / aspect, sin(a)) * rad);
+          }
+          halo = max(halo, sum / 10.0 * (1.2 - float(r) * 0.2));
+        }
+        // horizontal streaks: each row reaches out a flickering distance
+        float row = uv.y * 70.0;
+        float len = pow(noise(row + uTime * 2.5) * 0.65 + noise(row * 2.7 - uTime * 6.0) * 0.35, 2.2) * 0.42;
+        float streak = 0.0;
+        for (int j = 1; j <= 10; j++) {
+          float d = len * float(j) / 10.0;
+          float w = 1.0 - float(j) / 11.0;
+          streak = max(streak, max(fig(uv + vec2(d, 0.0)), fig(uv - vec2(d, 0.0))) * w);
+        }
+        float v = max(max(halo * 1.5, streak), fig(uv));
+        // trails: keep some of last frame's glow, drifting upward
+        float prev = texture2D(uPrev, vec2(uv.x, 1.0 - uv.y - 2.0 / uRes.y)).r;
+        v = max(v, prev * 0.88);
+        gl_FragColor = vec4(v, v, v, 1.0);
+      }`;
+
+    const AURA = `
+      precision highp float;
+      varying vec2 vUv;
+      uniform sampler2D uFig, uGlow, uVideo;
+      uniform vec2 uRes;
+      uniform float uTime, uOn;
+      float hash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+      void main() {
+        vec2 uv = vUv;
+        if (uOn < 0.5) { gl_FragColor = vec4(texture2D(uVideo, uv).rgb, 1.0); return; }
+        vec4 f = texture2D(uFig, vec2(uv.x, 1.0 - uv.y));
+        float g = texture2D(uGlow, vec2(uv.x, 1.0 - uv.y)).r;
+        // burnt-orange field, lighter in the middle
+        vec3 col = mix(vec3(0.55, 0.24, 0.11), vec3(0.76, 0.38, 0.19), smoothstep(0.9, 0.1, length((uv - 0.5) * vec2(1.0, 1.3))));
+        // glow: orange -> yellow -> white-hot next to the body
+        vec3 hot = mix(vec3(0.98, 0.64, 0.24), vec3(0.97, 0.94, 0.89), smoothstep(0.42, 0.78, g));
+        col = mix(col, hot, smoothstep(0.1, 0.32, g));
+        // the figure as an inverted teal-black silhouette with soft edges
+        float L = 1.0 - dot(f.rgb, vec3(0.299, 0.587, 0.114));
+        vec3 body = mix(vec3(0.02, 0.06, 0.07), vec3(0.1, 0.28, 0.32), smoothstep(0.25, 0.6, L));
+        body = mix(body, vec3(0.9, 0.88, 0.82), smoothstep(0.66, 0.92, L));
+        col = mix(col, body, smoothstep(0.35, 0.85, f.a));
+        // film grain
+        col += (hash(uv * uRes + fract(uTime) * 91.7) - 0.5) * 0.1;
         gl_FragColor = vec4(col, 1.0);
       }`;
 
@@ -209,79 +318,120 @@
       if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
       return s;
     }
-    const U = {};
-    let videoTex, maskTex;
-    function setupGL() {
+    function program(frag, uniforms) {
       const prog = gl.createProgram();
       gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
-      gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG));
+      gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, frag));
       gl.linkProgram(prog);
-      gl.useProgram(prog);
+      if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+      const u = { prog, aPos: gl.getAttribLocation(prog, 'aPos') };
+      for (const n of uniforms) u[n] = gl.getUniformLocation(prog, n);
+      return u;
+    }
+    function texture() {
+      const t = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, t);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      return t;
+    }
+    function target(w, h) {
+      const tex = texture();
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+      const fb = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      return { tex, fb, w, h };
+    }
+
+    let P, videoTex, maskTex, figT, glowT = [], glowI = 0;
+    function setupGL() {
+      P = {
+        figure: program(FIGURE, ['uVideo', 'uMask', 'uRes', 'uMaskTexel', 'uCx', 'uFaceTop', 'uChin', 'uNeck', 'uFw', 'uFh', 'uSpread', 'uDroop', 'uOn']),
+        glow: program(GLOW, ['uFig', 'uPrev', 'uRes', 'uTime']),
+        aura: program(AURA, ['uFig', 'uGlow', 'uVideo', 'uRes', 'uTime', 'uOn']),
+      };
       gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
       gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
-      const aPos = gl.getAttribLocation(prog, 'aPos');
-      gl.enableVertexAttribArray(aPos);
-      gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
-      for (const n of ['uVideo', 'uMask', 'uRes', 'uHead', 'uCx', 'uChin', 'uNeck', 'uFw', 'uFh', 'uSpread', 'uDroop', 'uBulge', 'uOn', 'uHasMask'])
-        U[n] = gl.getUniformLocation(prog, n);
-      const makeTexture = unit => {
-        const t = gl.createTexture();
-        gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, t);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-        return t;
-      };
-      videoTex = makeTexture(0); maskTex = makeTexture(1);
-      gl.uniform1i(U.uVideo, 0); gl.uniform1i(U.uMask, 1);
+      videoTex = texture(); maskTex = texture();
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    }
+    function resizeTargets(W, H) {
+      figT = target(W, H);
+      const gw = Math.round(W / 2), gh = Math.round(H / 2);
+      glowT = [target(gw, gh), target(gw, gh)];
+    }
+    function use(p, fb, w, h, textures) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+      gl.viewport(0, 0, w, h);
+      gl.useProgram(p.prog);
+      gl.enableVertexAttribArray(p.aPos);
+      gl.vertexAttribPointer(p.aPos, 2, gl.FLOAT, false, 0, 0);
+      textures.forEach(([name, tex], i) => {
+        gl.activeTexture(gl.TEXTURE0 + i); gl.bindTexture(gl.TEXTURE_2D, tex); gl.uniform1i(p[name], i);
+      });
     }
 
     function frame(now) {
       requestAnimationFrame(frame);
       if (!(video.readyState >= 2 && video.videoWidth)) return;
       const W = video.videoWidth, H = video.videoHeight;
-      if (out.width !== W || out.height !== H) { out.width = W; out.height = H; gl.viewport(0, 0, W, H); }
+      if (out.width !== W || out.height !== H) { out.width = W; out.height = H; resizeTargets(W, H); }
 
       let hasMask = false;
-      if (heads) {
+      if (effect) {
         lastTs = Math.max(now, lastTs + 1);
         try { trackFace(lastTs); } catch (err) { console.warn('face tracking failed', err); }
         try { hasMask = trackPerson(lastTs); } catch (err) { console.warn('outline tracking failed', err); }
       }
-
-      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, videoTex);
+      gl.bindTexture(gl.TEXTURE_2D, videoTex);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
       if (hasMask) {
-        gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, maskTex);
+        gl.bindTexture(gl.TEXTURE_2D, maskTex);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, maskW, maskH, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE, maskBytes);
       }
+      const on = effect && face && maskBytes ? 1 : 0;
+      const t = now / 1000;
 
-      const on = heads && face;
-      gl.uniform2f(U.uRes, W, H);
-      gl.uniform1f(U.uOn, on ? 1 : 0);
-      gl.uniform1f(U.uHasMask, hasMask ? 1 : 0);
-      if (on) {
-        const cx = face.x + face.w / 2, chin = face.y + face.h;
-        gl.uniform2f(U.uHead, cx, face.y + face.h * 0.38);
-        gl.uniform1f(U.uCx, cx);
-        gl.uniform1f(U.uChin, chin);
-        gl.uniform1f(U.uNeck, Math.min(H, chin + face.h * 0.55));
-        gl.uniform1f(U.uFw, face.w);
-        gl.uniform1f(U.uFh, face.h);
-        gl.uniform1f(U.uSpread, face.w * 1.15);
-        gl.uniform1f(U.uDroop, face.h * 0.15);
-        gl.uniform1f(U.uBulge, 0.55);
+      use(P.figure, figT.fb, W, H, [['uVideo', videoTex], ['uMask', maskTex]]);
+      gl.uniform2f(P.figure.uRes, W, H);
+      gl.uniform2f(P.figure.uMaskTexel, 1 / Math.max(1, maskW), 1 / Math.max(1, maskH));
+      gl.uniform1f(P.figure.uOn, on);
+      if (face) {
+        const chin = face.y + face.h;
+        gl.uniform1f(P.figure.uCx, face.x + face.w / 2);
+        gl.uniform1f(P.figure.uFaceTop, face.y);
+        gl.uniform1f(P.figure.uChin, chin);
+        gl.uniform1f(P.figure.uNeck, Math.min(H, chin + face.h * 0.55));
+        gl.uniform1f(P.figure.uFw, face.w);
+        gl.uniform1f(P.figure.uFh, face.h);
+        gl.uniform1f(P.figure.uSpread, face.w * 1.15);
+        gl.uniform1f(P.figure.uDroop, face.h * 0.15);
       }
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+      const cur = glowT[glowI], prev = glowT[1 - glowI];
+      use(P.glow, cur.fb, cur.w, cur.h, [['uFig', figT.tex], ['uPrev', prev.tex]]);
+      gl.uniform2f(P.glow.uRes, cur.w, cur.h);
+      gl.uniform1f(P.glow.uTime, t);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      glowI = 1 - glowI;
+
+      use(P.aura, null, W, H, [['uFig', figT.tex], ['uGlow', cur.tex], ['uVideo', videoTex]]);
+      gl.uniform2f(P.aura.uRes, W, H);
+      gl.uniform1f(P.aura.uTime, t);
+      gl.uniform1f(P.aura.uOn, on);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     }
 
     // ---------- controls ----------
     picker.addEventListener('change', () => start(picker.value));
-    document.getElementById('heads').addEventListener('click', e => {
-      heads = !heads;
-      e.target.textContent = `Three heads: ${heads ? 'on' : 'off'}`;
+    document.getElementById('effect').addEventListener('click', e => {
+      effect = !effect;
+      e.target.textContent = `Effect: ${effect ? 'on' : 'off'}`;
     });
     document.getElementById('mirror').addEventListener('click', e => {
       const on = out.classList.toggle('mirror');
