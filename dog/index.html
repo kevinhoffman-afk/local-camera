@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dog Vision</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; color: #fff; font: 14px/1.4 system-ui, sans-serif; }
+    video { display: none; }
+    canvas { width: 100%; height: 100%; object-fit: contain; display: block; touch-action: none; }
+    canvas.mirror { transform: scaleX(-1); }
+    .bar {
+      position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%);
+      display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: center;
+      padding: 8px 12px; border-radius: 12px; background: rgba(0, 0, 0, 0.55);
+      max-width: calc(100% - 32px); box-sizing: border-box;
+    }
+    select, button {
+      font: inherit; color: #fff; background: #222; border: 1px solid #444;
+      border-radius: 8px; padding: 6px 10px; cursor: pointer;
+    }
+    button:hover, select:hover { background: #333; }
+    .msg {
+      position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+      text-align: center; padding: 16px; pointer-events: none;
+    }
+    .msg[hidden] { display: none; }
+    .labels {
+      position: fixed; top: 12px; left: 12px; right: 12px; display: flex; justify-content: space-between;
+      font-size: 13px; font-weight: 600; text-shadow: 0 1px 4px rgba(0, 0, 0, 0.8); pointer-events: none;
+    }
+    .labels[hidden] { display: none; }
+  </style>
+</head>
+<body>
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="out" class="mirror"></canvas>
+  <div id="labels" class="labels" hidden><span>Human</span><span>Dog</span></div>
+  <div id="msg" class="msg">Starting camera…</div>
+  <div class="bar">
+    <select id="cameras" aria-label="Camera" hidden></select>
+    <button id="mode" type="button">Compare</button>
+    <button id="mirror" type="button">Mirror: on</button>
+    <button id="snap" type="button">Snapshot</button>
+  </div>
+
+  <script>
+    const video = document.getElementById('video');
+    const out = document.getElementById('out');
+    const msg = document.getElementById('msg');
+    const labels = document.getElementById('labels');
+    const picker = document.getElementById('cameras');
+    let stream = null;
+    let split = 0;                       // 0 = all dog; otherwise the compare divider (0..1 across the screen)
+
+    function show(text) { msg.textContent = text; msg.hidden = !text; }
+
+    // ---------- camera ----------
+    async function start(deviceId) {
+      if (stream) stream.getTracks().forEach(t => t.stop());
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: deviceId ? { deviceId: { exact: deviceId } } : { width: { ideal: 1280 }, height: { ideal: 720 } },
+          audio: false,
+        });
+        video.srcObject = stream;
+        await video.play();
+        show('');
+        await listCameras(stream.getVideoTracks()[0].getSettings().deviceId);
+      } catch (err) {
+        show(err.name === 'NotAllowedError'
+          ? 'Camera access was blocked. Allow it in your browser’s site settings and reload.'
+          : `Couldn’t start the camera: ${err.message}`);
+      }
+    }
+    // Device names are only available once permission has been granted.
+    async function listCameras(currentId) {
+      const devices = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+      picker.innerHTML = '';
+      devices.forEach((d, i) => picker.add(new Option(d.label || `Camera ${i + 1}`, d.deviceId, false, d.deviceId === currentId)));
+      picker.hidden = devices.length < 2;
+    }
+
+    // ---------- dog vision ----------
+    // Dogs have two cone types (peaks near 429 nm and 555 nm) instead of our three, so they
+    // see along a blue-yellow axis and reds and greens collapse together, much like a human
+    // deuteranope. Colours use the Machado et al. (2009) deuteranopia matrix in linear light.
+    // Dogs also resolve less detail (roughly 20/75), so the image is softened a little, and
+    // contrast is eased slightly.
+    const gl = out.getContext('webgl', { preserveDrawingBuffer: true });
+    const VERT = `
+      attribute vec2 aPos; varying vec2 vUv;
+      void main() { vUv = vec2(aPos.x * 0.5 + 0.5, 0.5 - aPos.y * 0.5); gl_Position = vec4(aPos, 0.0, 1.0); }`;
+    const FRAG = `
+      precision highp float;
+      varying vec2 vUv;
+      uniform sampler2D uVideo;
+      uniform vec2 uTexel;
+      uniform float uSplit, uMirror;
+
+      vec3 toLinear(vec3 c) { return pow(c, vec3(2.2)); }
+      vec3 toGamma(vec3 c) { return pow(clamp(c, 0.0, 1.0), vec3(1.0 / 2.2)); }
+      const mat3 DOG = mat3(                       // columns (GLSL is column-major)
+        0.367322, 0.280085, -0.011820,
+        0.860646, 0.672501,  0.042940,
+       -0.227968, 0.047413,  0.968881);
+
+      vec3 soft(vec2 uv) {                         // 9-tap blur for dog-level acuity
+        vec2 o = uTexel * 1.6;
+        vec3 s = texture2D(uVideo, uv).rgb * 4.0;
+        s += (texture2D(uVideo, uv + vec2(o.x, 0.0)).rgb + texture2D(uVideo, uv - vec2(o.x, 0.0)).rgb +
+              texture2D(uVideo, uv + vec2(0.0, o.y)).rgb + texture2D(uVideo, uv - vec2(0.0, o.y)).rgb) * 2.0;
+        s += texture2D(uVideo, uv + o).rgb + texture2D(uVideo, uv - o).rgb +
+             texture2D(uVideo, uv + vec2(o.x, -o.y)).rgb + texture2D(uVideo, uv + vec2(-o.x, o.y)).rgb;
+        return s / 16.0;
+      }
+
+      void main() {
+        vec3 human = texture2D(uVideo, vUv).rgb;
+        vec3 dog = toGamma(DOG * toLinear(soft(vUv)));
+        dog = (dog - 0.5) * 0.92 + 0.5;            // slightly flatter contrast
+        float screenX = uMirror > 0.5 ? 1.0 - vUv.x : vUv.x;
+        vec3 col = uSplit > 0.0 && screenX < uSplit ? human : dog;
+        if (uSplit > 0.0 && abs(screenX - uSplit) < uTexel.x * 1.5) col = vec3(1.0);   // divider
+        gl_FragColor = vec4(col, 1.0);
+      }`;
+
+    function compile(type, src) {
+      const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+      return s;
+    }
+    let U = {};
+    function setupGL() {
+      const prog = gl.createProgram();
+      gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
+      gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG));
+      gl.linkProgram(prog); gl.useProgram(prog);
+      gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+      const aPos = gl.getAttribLocation(prog, 'aPos');
+      gl.enableVertexAttribArray(aPos); gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+      for (const n of ['uVideo', 'uTexel', 'uSplit', 'uMirror']) U[n] = gl.getUniformLocation(prog, n);
+      const t = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, t);
+      for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR],
+                            [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]])
+        gl.texParameteri(gl.TEXTURE_2D, k, v);
+      gl.uniform1i(U.uVideo, 0);
+    }
+
+    function frame() {
+      requestAnimationFrame(frame);
+      if (!(video.readyState >= 2 && video.videoWidth)) return;
+      const W = video.videoWidth, H = video.videoHeight;
+      if (out.width !== W || out.height !== H) { out.width = W; out.height = H; gl.viewport(0, 0, W, H); }
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+      gl.uniform2f(U.uTexel, 1 / W, 1 / H);
+      gl.uniform1f(U.uSplit, split);
+      gl.uniform1f(U.uMirror, out.classList.contains('mirror') ? 1 : 0);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    }
+
+    // ---------- controls ----------
+    picker.addEventListener('change', () => start(picker.value));
+    document.getElementById('mode').addEventListener('click', e => {
+      split = split ? 0 : 0.5;
+      e.target.textContent = split ? 'Dog only' : 'Compare';
+      labels.hidden = !split;
+    });
+    // drag the divider in compare mode
+    let dragging = false;
+    const moveSplit = e => {
+      if (!split || !dragging) return;
+      const r = out.getBoundingClientRect();
+      // the video is letterboxed inside the canvas box; map to the drawn picture
+      const scale = Math.min(r.width / out.width, r.height / out.height);
+      const drawnW = out.width * scale, left = r.left + (r.width - drawnW) / 2;
+      split = Math.max(0.02, Math.min(0.98, (e.clientX - left) / drawnW));
+    };
+    out.addEventListener('pointerdown', e => { dragging = true; out.setPointerCapture(e.pointerId); moveSplit(e); });
+    out.addEventListener('pointermove', moveSplit);
+    out.addEventListener('pointerup', () => { dragging = false; });
+    document.getElementById('mirror').addEventListener('click', e => {
+      const on = out.classList.toggle('mirror');
+      e.target.textContent = `Mirror: ${on ? 'on' : 'off'}`;
+    });
+    document.getElementById('snap').addEventListener('click', () => {
+      if (!out.width) return;
+      const shot = document.createElement('canvas');
+      shot.width = out.width; shot.height = out.height;
+      const s = shot.getContext('2d');
+      if (out.classList.contains('mirror')) { s.translate(shot.width, 0); s.scale(-1, 1); }
+      s.drawImage(out, 0, 0);
+      const a = document.createElement('a');
+      a.href = shot.toDataURL('image/png');
+      a.download = `dog-vision-${new Date().toISOString().replace(/[:.]/g, '-')}.png`;
+      a.click();
+    });
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      show('This browser can’t access the camera here. Open the page from http://localhost.');
+    } else if (!gl) {
+      show('This browser doesn’t support WebGL, which the filter needs.');
+    } else {
+      setupGL();
+      start();
+      requestAnimationFrame(frame);
+    }
+  </script>
+</body>
+</html>
