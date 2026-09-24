@@ -63,7 +63,8 @@
 
     // Strokes are lists of points in video pixels, so they stay put when the window resizes.
     let strokes = [], current = null;
-    let tip = null;                                    // smoothed fingertip
+    let tip = null;                                    // smoothed pen nib: where the line is drawn
+    let pen = null;                                    // smoothed pen body: direction, length, shown?
     let penDown = false, downVotes = 0;                // pen state, debounced over a few frames
 
     function show(text) { msg.textContent = text; msg.hidden = !text; }
@@ -125,15 +126,26 @@
       let wantDown = false;
       if (lm) {
         const W = video.videoWidth, H = video.videoHeight;
-        const raw = { x: lm[8].x * W, y: lm[8].y * H };        // index fingertip
+        const P = i => ({ x: lm[i].x * W, y: lm[i].y * H });
+        const fTip = P(8), fKnuckle = P(5), fJoint = P(6);
+        // the finger's direction and length; the nib sits a little past the fingertip so
+        // the finger doesn't cover what you're tracing
+        const len = Math.hypot(fTip.x - fKnuckle.x, fTip.y - fKnuckle.y) || 1;
+        let dx = fTip.x - fJoint.x, dy = fTip.y - fJoint.y;
+        const dl = Math.hypot(dx, dy) || 1; dx /= dl; dy /= dl;
+        const raw = { x: fTip.x + dx * len * 0.32, y: fTip.y + dy * len * 0.32 };
         // smooth more when the finger is still (less jitter), less when it moves fast (less lag)
         if (!tip) tip = { ...raw };
         const speed = Math.hypot(raw.x - tip.x, raw.y - tip.y);
         const k = Math.min(1, 0.25 + speed / (W * 0.03));
         tip.x += (raw.x - tip.x) * k; tip.y += (raw.y - tip.y) * k;
-        wantDown = raised(lm, 8, 6) && !raised(lm, 12, 10);   // pointing: index up, middle down
+        if (!pen) pen = { dx, dy, len, show: 0 };
+        pen.dx += (dx - pen.dx) * 0.4; pen.dy += (dy - pen.dy) * 0.4; pen.len += (len - pen.len) * 0.3;
+        const straight = raised(lm, 8, 6);
+        pen.show += ((straight ? 1 : 0) - pen.show) * 0.3;     // fades in when the finger straightens
+        wantDown = straight && !raised(lm, 12, 10);           // pointing: index up, middle down
       } else {
-        tip = null;
+        tip = null; pen = null;
       }
       downVotes = Math.max(-2, Math.min(2, downVotes + (wantDown ? 1 : -1)));
       const next = downVotes >= 2 ? true : downVotes <= -2 ? false : penDown;
@@ -147,7 +159,7 @@
     }
 
     // ---------- drawing ----------
-    function lineWidth() { return Math.max(2, video.videoWidth * 0.0035); }
+    function lineWidth() { return Math.max(1.5, video.videoWidth * 0.0024); }
     function drawStrokes(ctx) {
       ctx.strokeStyle = INK; ctx.lineWidth = lineWidth();
       ctx.lineCap = 'round'; ctx.lineJoin = 'round';
@@ -167,13 +179,44 @@
         ctx.stroke();
       }
     }
+    // A slim, see-through pen laid along the straightened finger, nib at the drawing point.
+    function drawPen() {
+      if (!tip || !pen || pen.show < 0.05) return;
+      const m = Math.hypot(pen.dx, pen.dy) || 1, dx = pen.dx / m, dy = pen.dy / m;
+      const nx = -dy, ny = dx;                                 // across the pen
+      const w = Math.max(3, lineWidth() * 2.2);                // half-width of the barrel
+      const nibLen = pen.len * 0.3, bodyLen = pen.len * 1.05;
+      const at = (along, across) => [tip.x - dx * along + nx * across, tip.y - dy * along + ny * across];
+      g.save();
+      g.globalAlpha = pen.show;
+      g.beginPath();                                           // barrel + tapered nib
+      g.moveTo(...at(0, 0));
+      g.lineTo(...at(nibLen, w));
+      g.lineTo(...at(nibLen + bodyLen, w));
+      g.quadraticCurveTo(...at(nibLen + bodyLen + w * 1.4, 0), ...at(nibLen + bodyLen, -w));
+      g.lineTo(...at(nibLen, -w));
+      g.closePath();
+      g.fillStyle = 'rgba(255, 255, 255, 0.12)';              // mostly clear, so the image shows through
+      g.fill();
+      g.lineWidth = Math.max(1, lineWidth() * 0.5);
+      g.strokeStyle = 'rgba(0, 56, 255, 0.85)';
+      g.lineJoin = 'round';
+      g.stroke();
+      g.beginPath();                                           // band where the nib meets the barrel
+      g.moveTo(...at(nibLen, w)); g.lineTo(...at(nibLen, -w)); g.stroke();
+      g.beginPath();                                           // the ink tip
+      g.moveTo(...at(0, 0)); g.lineTo(...at(nibLen * 0.35, w * 0.35)); g.lineTo(...at(nibLen * 0.35, -w * 0.35));
+      g.closePath(); g.fillStyle = INK; g.fill();
+      g.restore();
+    }
     function drawCursor() {
       if (!tip) return;
+      if (pen && pen.show > 0.5) return drawPen();
+      drawPen();
       const r = lineWidth() * 2.2;
       g.lineWidth = Math.max(1.5, lineWidth() * 0.45);
-      g.strokeStyle = INK; g.fillStyle = INK;
-      g.beginPath(); g.arc(tip.x, tip.y, r, 0, Math.PI * 2);
-      if (penDown) g.fill(); else g.stroke();
+      g.strokeStyle = INK;
+      g.beginPath(); g.arc(tip.x, tip.y, r, 0, Math.PI * 2); g.stroke();
     }
 
     function frame(now) {
