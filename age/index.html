@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Age Mirror</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; color: #fff; font: 14px/1.4 system-ui, sans-serif; }
+    video { display: none; }
+    canvas#out { width: 100%; height: 100%; object-fit: contain; display: block; touch-action: none; }
+    canvas#out.mirror { transform: scaleX(-1); }
+    .panel {
+      position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%);
+      width: min(640px, calc(100% - 32px)); box-sizing: border-box;
+      padding: 12px 16px; border-radius: 14px; background: rgba(0, 0, 0, 0.6);
+    }
+    .age { display: flex; align-items: center; gap: 12px; }
+    .age output { font-size: 28px; font-weight: 700; min-width: 3.2em; text-align: right; font-variant-numeric: tabular-nums; }
+    .age input { flex: 1; accent-color: #ffb347; height: 28px; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: center; margin-top: 8px; font-size: 13px; }
+    .row label { display: flex; gap: 6px; align-items: center; opacity: 0.85; }
+    .row input[type=number] { width: 4em; font: inherit; color: #fff; background: #222; border: 1px solid #444; border-radius: 6px; padding: 3px 6px; }
+    button, select {
+      font: inherit; color: #fff; background: #222; border: 1px solid #444;
+      border-radius: 8px; padding: 5px 10px; cursor: pointer;
+    }
+    button:hover, select:hover { background: #333; }
+    .msg {
+      position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+      text-align: center; padding: 16px; pointer-events: none;
+    }
+    .msg[hidden] { display: none; }
+    .status { position: fixed; top: 12px; left: 12px; font-size: 12px; opacity: 0.75; pointer-events: none; }
+    .labels {
+      position: fixed; top: 12px; left: 12px; right: 12px; display: flex; justify-content: space-between;
+      font-size: 13px; font-weight: 600; text-shadow: 0 1px 4px rgba(0, 0, 0, 0.8); pointer-events: none;
+    }
+    .labels[hidden] { display: none; }
+  </style>
+</head>
+<body>
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="out" class="mirror"></canvas>
+  <div id="labels" class="labels" hidden><span>Now</span><span id="labelAge">Age</span></div>
+  <div id="msg" class="msg">Starting camera…</div>
+  <div id="status" class="status"></div>
+  <div class="panel">
+    <div class="age">
+      <input id="age" type="range" min="1" max="99" step="1" value="30" aria-label="Age">
+      <output id="ageOut" for="age">30</output>
+    </div>
+    <div class="row">
+      <label>Your age <input id="mine" type="number" min="5" max="95" value="30"></label>
+      <select id="cameras" aria-label="Camera" hidden></select>
+      <button id="mode" type="button">Compare</button>
+      <button id="mirror" type="button">Mirror: on</button>
+      <button id="snap" type="button">Snapshot</button>
+    </div>
+  </div>
+
+  <script type="module">
+    import { FaceLandmarker, ImageSegmenter, FilesetResolver } from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs';
+
+    const video = document.getElementById('video');
+    const out = document.getElementById('out');
+    const msg = document.getElementById('msg');
+    const status = document.getElementById('status');
+    const picker = document.getElementById('cameras');
+    const ageEl = document.getElementById('age'), ageOut = document.getElementById('ageOut');
+    const mineEl = document.getElementById('mine');
+    const labels = document.getElementById('labels'), labelAge = document.getElementById('labelAge');
+    let stream = null, faces = null, segmenter = null, lastTs = 0;
+    let split = 0;
+
+    function show(text) { msg.textContent = text; msg.hidden = !text; }
+
+    // ---------- camera ----------
+    async function start(deviceId) {
+      if (stream) stream.getTracks().forEach(t => t.stop());
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: deviceId ? { deviceId: { exact: deviceId } } : { width: { ideal: 1280 }, height: { ideal: 720 } },
+          audio: false,
+        });
+        video.srcObject = stream;
+        await video.play();
+        show('');
+        await listCameras(stream.getVideoTracks()[0].getSettings().deviceId);
+      } catch (err) {
+        show(err.name === 'NotAllowedError'
+          ? 'Camera access was blocked. Allow it in your browser’s site settings and reload.'
+          : `Couldn’t start the camera: ${err.message}`);
+      }
+    }
+    async function listCameras(currentId) {
+      const devices = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+      picker.innerHTML = '';
+      devices.forEach((d, i) => picker.add(new Option(d.label || `Camera ${i + 1}`, d.deviceId, false, d.deviceId === currentId)));
+      picker.hidden = devices.length < 2;
+    }
+
+    // ---------- tracking: face landmarks + hair / skin segmentation ----------
+    async function loadModels() {
+      status.textContent = 'Loading face tracking…';
+      try {
+        const vision = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+        [faces, segmenter] = await Promise.all([
+          FaceLandmarker.createFromOptions(vision, {
+            baseOptions: {
+              modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+              delegate: 'GPU',
+            },
+            runningMode: 'VIDEO', numFaces: 1,
+          }),
+          ImageSegmenter.createFromOptions(vision, {
+            baseOptions: {
+              modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/1/selfie_multiclass_256x256.tflite',
+              delegate: 'GPU',
+            },
+            runningMode: 'VIDEO', outputConfidenceMasks: true, outputCategoryMask: false,
+          }).catch(() => null),
+        ]);
+        status.textContent = segmenter ? '' : 'Hair tracking unavailable — face changes only';
+      } catch (err) {
+        status.textContent = 'Face tracking unavailable — check your connection and reload';
+      }
+    }
+
+    // Hair and face-skin masks, packed into one two-channel texture (hair, skin).
+    const small = document.createElement('canvas');
+    const sg = small.getContext('2d', { willReadFrequently: true });
+    let maskBytes = null, maskW = 0, maskH = 0;
+    function trackHairSkin(ts) {
+      if (!segmenter) return false;
+      const w = 256, h = Math.round(256 * video.videoHeight / video.videoWidth);
+      if (small.width !== w || small.height !== h) { small.width = w; small.height = h; }
+      sg.drawImage(video, 0, 0, w, h);
+      const res = segmenter.segmentForVideo(small, ts);
+      const m = res.confidenceMasks;
+      if (m && m.length >= 4) {
+        const hair = m[1].getAsFloat32Array(), skin = m[3].getAsFloat32Array();
+        if (!maskBytes || maskBytes.length !== hair.length * 2) maskBytes = new Uint8Array(hair.length * 2);
+        for (let i = 0; i < hair.length; i++) { maskBytes[i * 2] = hair[i] * 255; maskBytes[i * 2 + 1] = skin[i] * 255; }
+        maskW = m[1].width; maskH = m[1].height;
+      }
+      res.close();
+      return true;
+    }
+
+    let F = null;                                      // face geometry in video pixels, smoothed
+    function trackFace(ts) {
+      if (!faces) return;
+      const lm = faces.detectForVideo(video, ts).faceLandmarks[0];
+      if (!lm) { F = null; return; }
+      const W = video.videoWidth, H = video.videoHeight;
+      const P = i => [lm[i].x * W, lm[i].y * H];
+      const avg = (...ids) => { const s = [0, 0]; for (const i of ids) { const p = P(i); s[0] += p[0]; s[1] += p[1]; } return [s[0] / ids.length, s[1] / ids.length]; };
+      const d = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+      const eyeL = avg(33, 133, 159, 145), eyeR = avg(362, 263, 386, 374);
+      const next = {
+        P, eyeL, eyeR, eyeW: (d(P(33), P(133)) + d(P(362), P(263))) / 2,
+        nose: P(1), mouth: avg(13, 14), mouthL: P(61), mouthR: P(291), chin: P(152),
+        jawL: P(172), jawR: P(397), cheekL: P(205), cheekR: P(425),
+        centre: avg(1, 9, 152), faceW: d(P(234), P(454)), faceH: d(P(10), P(152)),
+        roll: Math.atan2(eyeR[1] - eyeL[1], eyeR[0] - eyeL[0]),
+      };
+      F = next;
+    }
+
+    // ---------- wrinkles, drawn from the landmarks onto their own canvas ----------
+    const creases = document.createElement('canvas');
+    const cg = creases.getContext('2d');
+    function drawCreases(o) {
+      const W = video.videoWidth, H = video.videoHeight;
+      if (creases.width !== W || creases.height !== H) { creases.width = W; creases.height = H; }
+      cg.clearRect(0, 0, W, H);
+      if (!F || o <= 0.02) return;
+      const { P, faceW, faceH, eyeW } = F;
+      const lerp = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+      const add = (a, b) => [a[0] + b[0], a[1] + b[1]];
+      const sc = (a, k) => [a[0] * k, a[1] * k];
+      // a crease: a soft dark groove with a faint highlight just below it, slightly irregular
+      let seed = 0;
+      const wob = () => { seed += 1; const x = Math.sin(seed * 12.9898) * 43758.5453; return x - Math.floor(x) - 0.5; };
+      const line = (pts, width, alpha) => {
+        if (alpha <= 0) return;
+        const j = faceW * 0.006;
+        pts = pts.map((q, i) => i === 0 || i === pts.length - 1 ? q : [q[0] + wob() * j, q[1] + wob() * j]);
+        const path = off => {
+          cg.beginPath(); cg.moveTo(pts[0][0] + off[0], pts[0][1] + off[1]);
+          if (pts.length === 3) cg.quadraticCurveTo(pts[1][0] + off[0], pts[1][1] + off[1], pts[2][0] + off[0], pts[2][1] + off[1]);
+          else for (let i = 1; i < pts.length; i++) cg.lineTo(pts[i][0] + off[0], pts[i][1] + off[1]);
+        };
+        cg.lineCap = 'round'; cg.lineJoin = 'round';
+        for (const [w, a] of [[3.6, 0.08], [2.0, 0.18], [1, 0.34]]) {
+          path([0, 0]); cg.strokeStyle = `rgba(0,0,0,${a * alpha})`; cg.lineWidth = width * w; cg.stroke();
+        }
+        path([0, width * 1.7]); cg.strokeStyle = `rgba(255,255,255,${0.22 * alpha})`; cg.lineWidth = width * 1.4; cg.stroke();
+      };
+      const ramp = (from, to) => Math.max(0, Math.min(1, (o - from) / (to - from)));
+      const w = faceW * 0.0045;
+
+      // forehead lines between the brows and the hairline
+      const B = P(9), T = P(10), Lb = P(105), Rb = P(334), up = [T[0] - B[0], T[1] - B[1]];
+      [0.28, 0.5, 0.72].forEach((t, i) => {
+        const v = sc(up, t);
+        line([add(Lb, v), add(add(B, sc(v, 1.08)), [0, -faceH * 0.01]), add(Rb, v)], w, ramp(0.05 + i * 0.12, 0.7) * 0.9);
+      });
+      // frown lines between the brows
+      for (const s of [-1, 1]) {
+        const base = add(B, [s * eyeW * 0.2, faceH * 0.02]);
+        line([base, add(base, [s * eyeW * 0.04, -eyeW * 0.55])], w * 0.9, ramp(0.3, 0.9) * 0.8);
+      }
+      // crow's feet fanning out from the outer eye corners
+      for (const [outer, inner] of [[33, 133], [263, 362]]) {
+        const o0 = P(outer), i0 = P(inner);
+        const dir = Math.atan2(o0[1] - i0[1], o0[0] - i0[0]);
+        for (const a of [-0.45, -0.05, 0.35]) {
+          const s = add(o0, [Math.cos(dir) * eyeW * 0.15, Math.sin(dir) * eyeW * 0.15]);
+          const e = add(s, [Math.cos(dir + a) * faceW * 0.07, Math.sin(dir + a) * faceW * 0.07]);
+          line([s, e], w * 0.8, ramp(0.2, 0.8) * 0.85);
+        }
+      }
+      // bags under the eyes
+      for (const [inner, lower, outer] of [[133, 145, 33], [362, 374, 263]]) {
+        const a = add(P(inner), [0, eyeW * 0.28]), c = add(P(lower), [0, eyeW * 0.6]), e = add(P(outer), [0, eyeW * 0.22]);
+        line([a, c, e], w * 1.1, ramp(0.12, 0.7));
+        line([add(a, [0, eyeW * 0.2]), add(c, [0, eyeW * 0.3]), add(e, [0, eyeW * 0.2])], w * 0.9, ramp(0.5, 1) * 0.7);
+      }
+      // smile lines from the nose to past the mouth corners, then marionette lines down
+      for (const [wing, corner, s] of [[129, 61, -1], [358, 291, 1]]) {
+        const a = add(P(wing), [s * eyeW * 0.15, 0]), e = add(P(corner), [s * eyeW * 0.25, faceH * 0.05]);
+        line([a, add(lerp(a, e, 0.5), [s * eyeW * 0.25, 0]), e], w * 1.2, ramp(0.08, 0.6));
+        line([add(P(corner), [s * eyeW * 0.05, faceH * 0.02]), add(P(corner), [s * eyeW * 0.12, faceH * 0.16])], w, ramp(0.4, 1) * 0.8);
+      }
+      // fine lines over the upper lip
+      const lip = P(0), mw = Math.hypot(P(291)[0] - P(61)[0], P(291)[1] - P(61)[1]);
+      for (const k of [-0.3, -0.12, 0.12, 0.3]) {
+        const s = add(lip, [k * mw, -faceH * 0.005]);
+        line([s, add(s, [0, -faceH * 0.04])], w * 0.6, ramp(0.6, 1) * 0.7);
+      }
+    }
+
+    // ---------- GPU compositing ----------
+    const gl = out.getContext('webgl', { preserveDrawingBuffer: true });
+    const VERT = `
+      attribute vec2 aPos; varying vec2 vUv;
+      void main() { vUv = vec2(aPos.x * 0.5 + 0.5, 0.5 - aPos.y * 0.5); gl_Position = vec4(aPos, 0.0, 1.0); }`;
+    const FRAG = `
+      precision highp float;
+      varying vec2 vUv;
+      uniform sampler2D uVideo, uMask, uCrease;
+      uniform vec2 uRes;
+      uniform float uOld, uYoung, uOn, uSplit, uMirror, uHasMask;
+      uniform vec2 uEyeL, uEyeR, uNose, uMouth, uMouthL, uMouthR, uJawL, uJawR, uCheekL, uCheekR, uCentre;
+      uniform float uEyeW, uFaceW, uFaceH, uRoll;
+
+      float bump(vec2 p, vec2 c, float r) { return 1.0 - smoothstep(0.0, r, length(p - c)); }
+      float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+      float noise(vec2 p) {
+        vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
+        return mix(mix(hash(i), hash(i + vec2(1, 0)), f.x), mix(hash(i + vec2(0, 1)), hash(i + vec2(1, 1)), f.x), f.y);
+      }
+      vec3 softLight(vec3 a, vec3 b) { return mix(2.0 * a * b + a * a * (1.0 - 2.0 * b), sqrt(a) * (2.0 * b - 1.0) + 2.0 * a * (1.0 - b), step(0.5, b)); }
+
+      // Where each output pixel samples the camera. Younger: bigger eyes, a smaller nose and
+      // lower face. Older: jowls, eyelids, mouth corners and nose sag downward.
+      vec2 warp(vec2 p) {
+        vec2 q = p;
+        for (int i = 0; i < 2; i++) {
+          vec2 e = i == 0 ? uEyeL : uEyeR;
+          q -= (p - e) * bump(p, e, uEyeW * 1.5) * 0.34 * uYoung;
+          q.y -= bump(p, e - vec2(0.0, uEyeW * 0.4), uEyeW * 0.85) * uEyeW * 0.2 * uOld;
+          vec2 j = i == 0 ? uJawL : uJawR;
+          q.y -= bump(p, j, uFaceW * 0.32) * uFaceH * 0.07 * uOld;
+          vec2 m = i == 0 ? uMouthL : uMouthR;
+          q.y -= bump(p, m, uEyeW * 0.7) * uFaceH * 0.035 * uOld;
+        }
+        float lower = smoothstep(uNose.y - uFaceH * 0.05, uNose.y + uFaceH * 0.08, p.y) * bump(p, uNose, uFaceH * 0.85);
+        q += (p - uNose) * lower * 0.3 * uYoung;
+        q += (p - uNose) * bump(p, uNose, uEyeW * 1.0) * 0.3 * uYoung;
+        q.y -= bump(p, uNose, uEyeW * 0.9) * uFaceH * 0.03 * uOld;
+        return q;
+      }
+      vec3 blur(vec2 q, float r) {
+        vec3 s = vec3(0.0);
+        for (int i = 0; i < 8; i++) {
+          float a = float(i) * 0.785398;
+          s += texture2D(uVideo, (q + vec2(cos(a), sin(a)) * r) / uRes).rgb;
+        }
+        return (s + texture2D(uVideo, q / uRes).rgb * 2.0) / 10.0;
+      }
+      float ell(vec2 p, vec2 c, vec2 r) { return 1.0 - smoothstep(0.7, 1.0, length((p - c) / r)); }
+
+      void main() {
+        vec2 p = vUv * uRes;
+        vec3 now = texture2D(uVideo, vUv).rgb;
+        vec3 col = now;
+        if (uOn > 0.5) {
+          vec2 q = warp(p);
+          col = texture2D(uVideo, q / uRes).rgb;
+          vec2 mk = uHasMask > 0.5 ? texture2D(uMask, q / uRes).ra : vec2(0.0, 1.0 - smoothstep(0.35, 0.62, length((q - uCentre) / vec2(uFaceW, uFaceH * 1.1))));
+          float hair = mk.x, skin = mk.y;
+          // keep eyes, brows and lips crisp
+          float keep = max(max(ell(q, uEyeL, vec2(uEyeW * 0.8, uEyeW * 0.5)), ell(q, uEyeR, vec2(uEyeW * 0.8, uEyeW * 0.5))),
+                           ell(q, uMouth, vec2(uEyeW * 1.0, uEyeW * 0.55)));
+          float sk = skin * (1.0 - keep);
+          vec3 soft = blur(q, uFaceW * 0.012);
+          float lum = dot(col, vec3(0.299, 0.587, 0.114));
+
+          // younger: smooth, bright skin and rosy cheeks
+          col = mix(col, soft, sk * clamp(uYoung * 1.5, 0.0, 0.85));
+          col *= 1.0 + 0.07 * uYoung * skin;
+          for (int i = 0; i < 2; i++) {
+            vec2 ch = i == 0 ? uCheekL : uCheekR;
+            col = mix(col, col * vec3(1.1, 0.93, 0.93) + vec3(0.03, 0.0, 0.0), bump(q, ch, uFaceW * 0.2) * 0.6 * uYoung * skin);
+          }
+          col = mix(col, col * 1.08, hair * uYoung * 0.4);
+
+          // older: more skin texture, duller and yellower, age spots, creases, grey hair
+          col = mix(col, col + (col - soft) * 1.8, sk * uOld);
+          col = mix(col, vec3(dot(col, vec3(0.299, 0.587, 0.114))), 0.3 * uOld * skin);
+          col *= mix(vec3(1.0), vec3(1.03, 0.98, 0.86), uOld * skin);
+          vec2 lp = q - uCentre;
+          lp = vec2(cos(-uRoll) * lp.x - sin(-uRoll) * lp.y, sin(-uRoll) * lp.x + cos(-uRoll) * lp.y) / uFaceW;
+          float spot = smoothstep(0.72, 0.86, noise(lp * 16.0 + 7.3)) * smoothstep(0.35, 1.0, uOld) * sk;
+          col = mix(col, col * vec3(0.8, 0.68, 0.56), spot * 0.7);
+          vec4 cr = texture2D(uCrease, q / uRes);
+          col = mix(col, softLight(clamp(col, 0.0, 1.0), cr.rgb), clamp(cr.a * 1.3, 0.0, 1.0) * skin);
+          float grey = clamp(uOld * 1.4, 0.0, 1.0);
+          col = mix(col, vec3(lum * 0.5 + 0.45), hair * grey);
+          // Facial hair: pixels on the lower face that are clearly darker than your own cheek
+          // skin (sampled live just under the eyes). It greys with age and fades into skin
+          // for a child.
+          vec2 fl = lp * vec2(1.0, uFaceW / uFaceH);                      // face space, upright
+          float lowerFace = smoothstep(0.02, 0.12, (q - uNose).y / uFaceH) * (1.0 - smoothstep(0.42, 0.55, length(fl * vec2(1.0, 0.8))));
+          vec3 cheekTone = (blur(uCheekL - vec2(0.0, uFaceH * 0.08), uFaceW * 0.03) + blur(uCheekR - vec2(0.0, uFaceH * 0.08), uFaceW * 0.03)) * 0.5;
+          float cheekLum = dot(cheekTone, vec3(0.299, 0.587, 0.114));
+          float beard = lowerFace * (1.0 - keep) * clamp((cheekLum - lum) / (cheekLum * 0.35 + 0.02), 0.0, 1.0);
+          col = mix(col, vec3(0.84, 0.8, 0.74) * (0.55 + 0.6 * lum), beard * smoothstep(0.05, 0.2, lum) * clamp(uOld * 1.3, 0.0, 1.0) * 0.8);   // not deep shadows
+          col = mix(col, cheekTone * (0.92 + 0.12 * lum / max(cheekLum, 0.05)), beard * smoothstep(0.1, 0.6, uYoung));
+        }
+        float screenX = uMirror > 0.5 ? 1.0 - vUv.x : vUv.x;
+        if (uSplit > 0.0 && screenX < uSplit) col = now;
+        if (uSplit > 0.0 && abs(screenX - uSplit) < 1.5 / uRes.x) col = vec3(1.0);
+        gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
+      }`;
+
+    function compile(type, src) {
+      const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+      return s;
+    }
+    const U = {};
+    let texVideo, texMask, texCrease;
+    function setupGL() {
+      const prog = gl.createProgram();
+      gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
+      gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG));
+      gl.linkProgram(prog); gl.useProgram(prog);
+      gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+      const aPos = gl.getAttribLocation(prog, 'aPos');
+      gl.enableVertexAttribArray(aPos); gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+      for (const n of ['uVideo', 'uMask', 'uCrease', 'uRes', 'uOld', 'uYoung', 'uOn', 'uSplit', 'uMirror', 'uHasMask',
+        'uEyeL', 'uEyeR', 'uNose', 'uMouth', 'uMouthL', 'uMouthR', 'uJawL', 'uJawR', 'uCheekL', 'uCheekR', 'uCentre',
+        'uEyeW', 'uFaceW', 'uFaceH', 'uRoll']) U[n] = gl.getUniformLocation(prog, n);
+      const tex = unit => {
+        const t = gl.createTexture();
+        gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, t);
+        for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR],
+                              [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]])
+          gl.texParameteri(gl.TEXTURE_2D, k, v);
+        return t;
+      };
+      texVideo = tex(0); texMask = tex(1); texCrease = tex(2);
+      gl.uniform1i(U.uVideo, 0); gl.uniform1i(U.uMask, 1); gl.uniform1i(U.uCrease, 2);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    }
+
+    // How far the slider is from your own age, as 0..1 toward 99 (older) or toward 1 (younger).
+    function amounts() {
+      const age = +ageEl.value, mine = Math.max(5, Math.min(95, +mineEl.value || 30));
+      return { old: Math.max(0, (age - mine) / (99 - mine)), young: Math.max(0, (mine - age) / (mine - 1)) };
+    }
+
+    function frame(now) {
+      requestAnimationFrame(frame);
+      if (!(video.readyState >= 2 && video.videoWidth)) return;
+      const W = video.videoWidth, H = video.videoHeight;
+      if (out.width !== W || out.height !== H) { out.width = W; out.height = H; gl.viewport(0, 0, W, H); }
+      lastTs = Math.max(now, lastTs + 1);
+      try { trackFace(lastTs); } catch (err) { console.warn('face tracking failed', err); }
+      let hasMask = false;
+      try { hasMask = trackHairSkin(lastTs) && !!maskBytes; } catch (err) { console.warn('hair tracking failed', err); }
+      const { old, young } = amounts();
+      drawCreases(old);
+
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texVideo);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+      if (hasMask) {
+        gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texMask);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE_ALPHA, maskW, maskH, 0, gl.LUMINANCE_ALPHA, gl.UNSIGNED_BYTE, maskBytes);
+      }
+      gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, texCrease);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, creases);
+
+      gl.uniform2f(U.uRes, W, H);
+      gl.uniform1f(U.uOn, F ? 1 : 0);
+      gl.uniform1f(U.uHasMask, hasMask ? 1 : 0);
+      gl.uniform1f(U.uOld, old); gl.uniform1f(U.uYoung, young);
+      gl.uniform1f(U.uSplit, split);
+      gl.uniform1f(U.uMirror, out.classList.contains('mirror') ? 1 : 0);
+      if (F) {
+        for (const k of ['eyeL', 'eyeR', 'nose', 'mouth', 'mouthL', 'mouthR', 'jawL', 'jawR', 'cheekL', 'cheekR', 'centre'])
+          gl.uniform2f(U['u' + k[0].toUpperCase() + k.slice(1)], F[k][0], F[k][1]);
+        gl.uniform1f(U.uEyeW, F.eyeW); gl.uniform1f(U.uFaceW, F.faceW); gl.uniform1f(U.uFaceH, F.faceH); gl.uniform1f(U.uRoll, F.roll);
+      }
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    }
+
+    // ---------- controls ----------
+    function showAge() { ageOut.textContent = ageEl.value; labelAge.textContent = `Age ${ageEl.value}`; }
+    ageEl.addEventListener('input', showAge);
+    mineEl.addEventListener('change', () => { ageEl.value = Math.max(1, Math.min(99, +mineEl.value || 30)); showAge(); });
+    picker.addEventListener('change', () => start(picker.value));
+    document.getElementById('mode').addEventListener('click', e => {
+      split = split ? 0 : 0.5;
+      e.target.textContent = split ? 'Full view' : 'Compare';
+      labels.hidden = !split;
+    });
+    let dragging = false;
+    const moveSplit = e => {
+      if (!split || !dragging) return;
+      const r = out.getBoundingClientRect();
+      const scale = Math.min(r.width / out.width, r.height / out.height);
+      const drawnW = out.width * scale, left = r.left + (r.width - drawnW) / 2;
+      split = Math.max(0.02, Math.min(0.98, (e.clientX - left) / drawnW));
+    };
+    out.addEventListener('pointerdown', e => { dragging = true; out.setPointerCapture(e.pointerId); moveSplit(e); });
+    out.addEventListener('pointermove', moveSplit);
+    out.addEventListener('pointerup', () => { dragging = false; });
+    document.getElementById('mirror').addEventListener('click', e => {
+      const on = out.classList.toggle('mirror');
+      e.target.textContent = `Mirror: ${on ? 'on' : 'off'}`;
+    });
+    document.getElementById('snap').addEventListener('click', () => {
+      if (!out.width) return;
+      const shot = document.createElement('canvas');
+      shot.width = out.width; shot.height = out.height;
+      const s = shot.getContext('2d');
+      if (out.classList.contains('mirror')) { s.translate(shot.width, 0); s.scale(-1, 1); }
+      s.drawImage(out, 0, 0);
+      const a = document.createElement('a');
+      a.href = shot.toDataURL('image/png');
+      a.download = `age-${ageEl.value}-${new Date().toISOString().replace(/[:.]/g, '-')}.png`;
+      a.click();
+    });
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      show('This browser can’t access the camera here. Open the page from http://localhost.');
+    } else if (!gl) {
+      show('This browser doesn’t support WebGL, which the effect needs.');
+    } else {
+      setupGL();
+      loadModels();
+      start();
+      requestAnimationFrame(frame);
+    }
+  </script>
+</body>
+</html>
